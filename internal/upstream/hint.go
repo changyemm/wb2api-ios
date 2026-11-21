@@ -1,0 +1,266 @@
+// hint.go 网关错误附加说明字段（error.gateway_hint）的单一事实来源。
+//
+// 纪律（任务书 gateway-hint）：
+//   - error.message 永远是上游 body 原文透传（5755fe3 透传原则不动）；
+//     gateway_hint 只做与 message **并列**的网关视角补充说明，绝不替换/包装 message。
+//   - 文案集中在本文件（一张 Kind 表 + 11133/11135 形态判定），按 ErrKind + 上下文
+//     （请求带图/模型目录能力）映射，不散落 handler 的 if-else。
+//   - 未覆盖形态返回空串 → 响应不带该字段（不编造）。
+//   - hint 措辞是英文（错误响应面向客户端工具链，英文是通用口径）。
+package upstream
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+)
+
+// GatewayHint 按错误形态返回网关视角的补充说明（error.gateway_hint 字段值）。
+// msg 是上游错误 body 原文（或 SSE error 帧 payload）；kind 是权威分类
+// （Classify / *Error 信封）。返回空串 = 未覆盖形态，调用方不带字段。
+//
+// ctx 携带判定 hint 所需的请求侧上下文（零值合法，信息缺失时相关形态退为中性
+// hint 或无 hint）：
+//   - HasImage：请求体是否携带 image_url part（11133 的「模型不支持图片」指向前提）；
+//   - Model / ModelInCatalog / ModelSupportsImages：模型目录对该模型的
+//     supports_images 声明（目录未收录 → 不做「不支持」判定，防查不到误判成不支持）。
+//
+// 判定次序：11133/11135 上游业务码**先于** Kind 表——实测这两族归 ErrClient/
+// ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
+// 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
+func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
+	// 11103「Backend [x] is not supported」：模型的上游后端没启用/配置不全。上游自带的
+	// displayTips 就是「请换其他模型」，但客户端看到的那份在工作区里、日志里只剩一句
+	// 英文；这里点名「换号无用」，省掉一轮全池轮转与「账号是不是挂了」的误判。
+	if hasBusinessCode(msg, "11103") || codeMarker(strings.ToLower(msg), "11103") {
+		return "this model's backend is not enabled upstream (11103); switching accounts will not help — switch model"
+	}
+	// 音色未配置（TTS）：上游 500 + code 10000，与账号无关。必须排在 ErrBadParams
+	// 的通用文案之前，否则客户端只会看到「参数被拒」而不知道该省掉 voice。
+	if strings.Contains(strings.ToLower(msg), "get voice config failed") {
+		return `voice is not configured upstream (not an account problem); omit "voice" to use the default ` + TTSDefaultVoice
+	}
+	// 15053 ASR recognition failed：上游解不出这段音频（裸 PCM 无容器头必现，实测）。
+	if codeMarker(strings.ToLower(msg), "15053") {
+		return "upstream could not recognise this audio (15053); send a WAV or WebM container — bare PCM has no header to sniff"
+	}
+	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
+	// 参数被模型供应商拒绝）。只有请求确实带图、且目录**显式声明**该模型不支持图片
+	// 时才给「换模型」指向——目录只收录而不声明该能力（缺键）时无从判断，退中性
+	// 参数形态（断言「不支持」等于编造能力事实，客户端会照 hint 白换模型）。
+	if isModelParamInvalid(msg) {
+		if ctx.HasImage && ctx.ModelInCatalog && ctx.ModelSupportsImagesKnown && !ctx.ModelSupportsImages {
+			return "model " + ctx.Model + " does not support images; pick one with supports_images=true from /v1/models"
+		}
+		return "request parameters were rejected by the model provider; check message format and model capabilities"
+	}
+	// 11135 invalid_image_data 家族（图片数据无效，Discussion #77 实测形态）。
+	if isInvalidImageData(msg) {
+		return "image data rejected by upstream; use a real/valid image, may need a new conversation"
+	}
+	switch kind {
+	case ErrPromptTooLong:
+		return "request context exceeds the model's limit; reduce history/message size"
+	case ErrImageInvalid:
+		return "image request was rejected by upstream; check image_url format and image data"
+	case ErrWafBlock:
+		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
+		// （等待窗口过去再试，换号/立刻重试无意义）。
+		return "upstream WAF blocked the gateway; retry after the block window"
+	case ErrSoftRate:
+		return "rate limited by upstream; retry after reset"
+	case ErrAccountFault:
+		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
+	case ErrSessionDead:
+		return "account session expired at upstream; the account is disabled until re-login"
+	case ErrHardCredit:
+		// 不能说「等签到恢复」：国际版账号**没有签到活动**（本网关日志：国际版签到
+		// 活动未开启，跳过），积分只能靠充值/订阅恢复。旧文案对 global 号的持有者
+		// 是一个永远不会兑现的承诺（issue #191 的延伸）。
+		return "account credits exhausted at upstream; CN accounts recover via the next daily check-in, global accounts need a top-up"
+	case ErrUpstreamBusy:
+		// 11134 供应商过载：同属容量信号，但不是排队——换个模型是有效出路，说「队列满」
+		// 会把人引去查排队。
+		if IsProviderOverloaded(msg) {
+			return "the upstream model provider is temporarily overloaded (not an account problem); retry after the Retry-After delay or switch to another model"
+		}
+		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
+		// 指引客户端短等待后重试（SDK 指数退避天然适配）。
+		return "upstream admission queue is full (channel-level capacity, not an account problem); retry after a short wait"
+	case ErrToolMismatch:
+		// 11148 配对断裂：请求内容（会话历史里的 tool_calls / tool 结果）本身对不上，
+		// 上游明示「直接重试无效，请新建任务」。措辞指向「开新会话」而不是「换个账号
+		// 重试」——换号/重试都必然同样失败。
+		return "request tool-call history is broken (call/result mismatch); upstream rejects this request as-is — start a new conversation instead of retrying"
+	case ErrEmptyContent:
+		// 11151 空段：上游对「某条消息的 text 段是空串」判硬 400。出站前网关已补位，
+		// 客户端能做的是把那条空消息删掉或换新会话——重试必然复现。
+		return "request history contains an empty text block; upstream rejects it as-is — drop that message or start a new conversation"
+	case ErrModelMissing:
+		// 11102：模型 id 在上游不存在（id 大小写敏感，display name 也算不存在——实测
+		// "DeepSeek-V4.1-Flash" 全池 11102，id "deepseek-v4.1-flash" 立刻 200）。
+		// 点名「换号无用」，否则客户端会以为换个号能过。
+		return "model id does not exist upstream (ids are case-sensitive); copy the id from /v1/models — switching accounts will not help"
+	case ErrModelBlocked:
+		return "upstream has no such model on this backend; switch model or retry on another account"
+	case ErrContentBlocked:
+		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
+		// （handler_test 的泄漏守卫），hint 遵守同一口径。
+		return "request content was rejected by content policy; adjust the prompt and retry"
+	case ErrBadParams:
+		// 11129/11152：整颗工具定义被拒（schema 形态或工具名），换号重试必然复现。
+		// 上游原文只说「工具定义不合规」，客户端看不出该改哪儿，这里点名是 tools。
+		if isToolSchemaRejected(msg, strings.ToLower(msg)) {
+			return "the request's tool definitions were rejected by upstream (schema shape or tool name); fix or drop the offending tool — retrying as-is fails the same way"
+		}
+		return ""
+	default:
+		// ErrNone/ErrNotFound/ErrServer/ErrClient 等未覆盖形态：无 hint。
+		return ""
+	}
+}
+
+// HintContext gateway_hint 判定所需的请求侧上下文（handler 侧组装，见
+// Handler.hintContext）。零值合法。
+type HintContext struct {
+	Model               string // 请求裸模型名（可空）
+	HasImage            bool   // 请求体是否携带 image_url part
+	ModelSupportsImages bool   // 模型目录 supports_images 声明（仅 ModelInCatalog 时有意义）
+	// ModelSupportsImagesKnown 目录是否**显式**声明过该能力。缺失时不得断言「不支持
+	// 图片」（那是编造能力事实），只能退中性参数文案。
+	ModelSupportsImagesKnown bool
+	ModelInCatalog           bool // 模型目录是否收录该模型（「不支持」判定的前提）
+}
+
+// noHealthyHint 本地调度类错误（池中无健康号可用/传输层抖动，无上游原文可透传）
+// 的固定 hint。不进 GatewayHint：它没有 ErrKind，是网关自己的调度事实。
+const noHealthyHint = "no healthy account available in pool; check /status or retry later"
+
+// NoHealthyAccountHint 本地调度错误的 gateway_hint（与 no_healthy_account code 配套）。
+func NoHealthyAccountHint() string { return noHealthyHint }
+
+// NoHealthyAccountHintForModel 本地调度错误的 gateway_hint，带 realm 感知。
+//
+// 为什么需要它：裸模型名一律按 cn 域路由（见 server.resolveModel）。池里若只有
+// 另一域的账号，选号必然失败，但固定文案 "check /status" 会把人指向一个永远健康的
+// 面板——池子没毛病，是请求落错了域，重试多少次结果都一样。此时直接把「该怎么写」
+// 告诉客户端，比让人去翻 issue 有用。
+//
+// otherRealm 为空 = 另一域也没有该模型的健康号（或模型名为空），退回固定文案，
+// 不对能力做任何断言。
+func NoHealthyAccountHintForModel(bareModel, otherRealm string) string {
+	if bareModel == "" || otherRealm == "" {
+		return noHealthyHint
+	}
+	return `model "` + bareModel + `" is only available in the ` + otherRealm +
+		` realm; retry with "` + otherRealm + `:` + bareModel + `"`
+}
+
+// FrameHintFunc 返回 SSE error 帧的 gateway_hint 判定函数（Stream 的可选参数）。
+// ctxFn 惰性求值：仅在实际撞到 error 帧才调用（正常流零开销，模型目录查询
+// 不会为每个成功请求触发）。
+func FrameHintFunc(ctxFn func() HintContext) func(string) string {
+	return func(payload string) string {
+		if payload == "" || payload == "[DONE]" {
+			return ""
+		}
+		return GatewayHint(FrameKind(payload), payload, ctxFn())
+	}
+}
+
+// frameRequestCodes 首帧 error 帧里按 error.code 直接定类的请求级错误。帧路径 code 优先；
+// HTTP 路径的 Classify 先判限流文案，所以 11115 配「too many tokens」之类措辞时 HTTP 上仍是
+// ErrSoftRate，两条路径在这个边角上不一致，本表不去改 Classify。
+// 11101 不在内：它与图片文案共用 code，须交给 Classify 的文案优先序。
+var frameRequestCodes = []struct {
+	code string
+	kind ErrKind
+}{
+	{"11115", ErrPromptTooLong},
+	{"11129", ErrBadParams},
+	// 11103 后端未启用：请求级（换号无用），与 Classify 的 400 分支同口径。
+	{"11103", ErrModelParamInvalid},
+	// 11152 工具名不合规/重名：与 11129 同类（错在客户端声明的 tools），不登记就会滑到
+	// 通用 4xx → 喂连败 + 轮转全池 + 末端 503（2026-11-18 真机实测）。
+	{"11152", ErrBadParams},
+	{"11133", ErrModelParamInvalid},
+	{"11135", ErrImageInvalid},
+	{"11148", ErrToolMismatch},
+	{"11151", ErrEmptyContent},
+}
+
+// FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流的流式形态
+// （IsModelRateLimit 对帧 JSON 直接命中）优先；其余取帧内 error.message 走
+// Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
+func FrameKind(payload string) ErrKind {
+	if IsModelRateLimit(payload) {
+		return ErrSoftRate
+	}
+	// 11140 账号风控限制文书要 code + 文案同时成立，而 code 在帧的 error.code 上、不在
+	// message 里：只拿 message 去 Classify 会把它判成普通 4xx，首帧否决后照样换号。
+	if IsRestricted(payload) {
+		return ErrAccountFault
+	}
+	// 请求级错误以业务码为准：帧里 code 在 error.code 上，只拿 message 去 Classify 会丢掉它，
+	// 而 message 措辞不保证带已知文案（11129 可能是英文原文 / 下划线形态 / 中文 displayMsg，
+	// 11133 的真实措辞不含 isModelParamInvalid 的任何文案 marker，11151 在 Classify 里只认结构化
+	// code）——判成普通 4xx 后首帧否决照样换号、末端 503。
+	var f struct {
+		Error struct {
+			Code    any    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(payload), &f) != nil {
+		return ErrNone
+	}
+	if f.Error.Code != nil {
+		code := strings.TrimSpace(fmt.Sprint(f.Error.Code))
+		for _, c := range frameRequestCodes {
+			if code == c.code {
+				return c.kind
+			}
+		}
+	}
+	if f.Error.Message == "" {
+		return ErrNone
+	}
+	return Classify(http.StatusBadRequest, f.Error.Message)
+}
+
+// isModelParamInvalid 上游 11133 body 判定（code 11133 / extError.code=
+// model_param_invalid / msg 文案家族）。子串口径：hint 是补充说明非权威分类，
+// 宁宽勿漏。
+func isModelParamInvalid(body string) bool {
+	lower := strings.ToLower(body)
+	return codeMarker(lower, "11133") ||
+		strings.Contains(lower, "model_param_invalid") ||
+		strings.Contains(lower, "invalid request parameters") ||
+		strings.Contains(lower, "request parameters do not meet the current model requirements")
+}
+
+// isInvalidImageData 上游 11135 body 判定（code 11135 / invalid_image_data /
+// "replace the image" msg 家族）。
+func isInvalidImageData(body string) bool {
+	lower := strings.ToLower(body)
+	return codeMarker(lower, "11135") ||
+		strings.Contains(lower, "invalid_image_data") ||
+		strings.Contains(lower, "replace the image")
+}
+
+// codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，
+// 与 IsModelBlocked 的 code 判定同容差口径）。lower 须为小写 body。
+// HasCodeMarker 包外判据入口（server 侧 applyErrorPolicy 分野用）：按 codeMarker 的空白
+// 容差在原文里找业务码。同一条 msg 骑不同 code 的故障要靠它区分——例如 "request illegal"
+// 既是 11140 授权风控，也是 "11-128" 渠道校验拦截（见 handler 的 ErrAccountFault 分支）。
+func HasCodeMarker(body, code string) bool { return codeMarker(strings.ToLower(body), code) }
+
+func codeMarker(lower, code string) bool {
+	for _, v := range []string{`"code":` + code, `"code": ` + code, `"code":"` + code + `"`, `"code": "` + code + `"`, `"code":" ` + code + `"`, `"code": '` + code + `'`} {
+		if strings.Contains(lower, v) {
+			return true
+		}
+	}
+	return false
+}

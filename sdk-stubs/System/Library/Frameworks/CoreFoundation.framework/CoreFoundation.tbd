@@ -1,0 +1,9 @@
+--- !tapi-tbd-v3
+archs: [ arm64 ]
+uuids: [ 'arm64: 00000000-0000-0000-0000-000000000000' ]
+platform: macos
+install-name: /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation
+exports:
+  - archs: [ arm64 ]
+    symbols: [ _CFArrayAppendValue, _CFArrayCreateMutable, _CFArrayGetCount, _CFArrayGetValueAtIndex, _CFDataCreate, _CFDataGetBytePtr, _CFDataGetLength, _CFDateCreate, _CFErrorCopyDescription, _CFErrorGetCode, _CFRelease, _CFStringCreateExternalRepresentation, _CFStringCreateWithBytes ]
+...

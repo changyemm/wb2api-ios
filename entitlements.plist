@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 注入 dylib 的常规四条（与 gan-jibamao 的 daemon 版一致）。
+	     注意：entitlements 是进程属性，由主程序签名决定；dylib 自身
+	     的 entitlements 主要影响 dyld 是否放行加载。白膜注入器
+	     负责最终签名，这里先按惯例带上，真机验证时以注入器行为为准。 -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.memorystatus</key>
+	<true/>
+</dict>
+</plist>

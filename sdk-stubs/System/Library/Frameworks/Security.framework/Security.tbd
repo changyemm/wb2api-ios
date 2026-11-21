@@ -1,0 +1,9 @@
+--- !tapi-tbd-v3
+archs: [ arm64 ]
+uuids: [ 'arm64: 00000000-0000-0000-0000-000000000000' ]
+platform: macos
+install-name: /System/Library/Frameworks/Security.framework/Security
+exports:
+  - archs: [ arm64 ]
+    symbols: [ _SecCertificateCopyData, _SecCertificateCreateWithData, _SecPolicyCreateSSL, _SecTrustCopyCertificateChain, _SecTrustCreateWithCertificates, _SecTrustEvaluateWithError, _SecTrustSetVerifyDate ]
+...

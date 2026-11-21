@@ -1,0 +1,126 @@
+name: build-dylib
+
+# 构建单个 .dylib，全程 ubuntu-latest，无需 Apple SDK（2026-11-21 本机实测通过）：
+#   1. Go c-archive：GOOS=darwin + zig cc（zig 自带 Darwin 头文件）
+#   2. patch .a：逐成员 LC_BUILD_VERSION platform 1→2、minos→15.0
+#   3. 链接 tweak：zig cc -target aarch64-macos.11.0-none（zig 只给 macOS 11.0
+#      提供 libc；-gnu ABI 不行，要用 -none）+ sdk-stubs 里的
+#      CoreFoundation/Security .tbd（Go runtime 只要 20 个符号）
+#   4. patch dylib：LC_BUILD_VERSION platform 1→2、minos→15.0
+#   5. ldid 签名（可选，失败不影响绿）→ artifact
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install zig 0.15.2
+        run: |
+          curl -sL -o /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+          echo "ZIG_INC=/tmp/zig-x86_64-linux-0.15.2/lib/libc/include/any-macos-any" >> "$GITHUB_ENV"
+
+      - name: Version (upstream 约定：上海时间 vYYYY.M.D.HMM)
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/v}"
+          else
+            V="$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "version=$V"
+
+      - name: go vet (carchive 入口)
+        run: go vet ./cmd/carchive/
+
+      - name: go test (上游单测)
+        run: go test ./... 2>&1 | tail -30
+
+      - name: Build c-archive (darwin/arm64, cgo via zig)
+        run: |
+          export CGO_ENABLED=1 GOOS=darwin GOARCH=arm64
+          export CC="zig cc -target aarch64-macos-gnu"
+          export CGO_CFLAGS="-I${ZIG_INC} -Wno-nullability-completeness"
+          go build -trimpath \
+            -ldflags="-s -w -X main.appVersion=${{ steps.ver.outputs.version }}" \
+            -buildmode=c-archive -o libwb2api.a ./cmd/carchive
+          ls -l libwb2api.a libwb2api.h
+
+      - name: Patch archive platform macOS(1) -> iOS(2)
+        run: |
+          python3 scripts/patch_archive_platform.py libwb2api.a libwb2api-ios.a
+          ls -l libwb2api-ios.a
+
+      - name: Link tweak dylib (zig cc, macOS 11.0-none + framework stubs)
+        run: |
+          zig cc -target aarch64-macos.11.0-none \
+            -I"${ZIG_INC}" -Wno-nullability-completeness \
+            -dynamiclib \
+            -F sdk-stubs/System/Library/Frameworks \
+            -framework CoreFoundation -framework Security \
+            -o wb2api-macos.dylib tweak/tweak.c libwb2api.a
+          python3 scripts/patch_dylib_platform.py wb2api-macos.dylib wb2api.dylib
+          ls -l wb2api.dylib
+
+      - name: Verify dylib (platform=2, WB 导出符号, 只链三个系统库)
+        run: |
+          python3 - <<'EOF'
+          import struct
+          data = open('wb2api.dylib','rb').read()
+          assert struct.unpack('<I', data[:4])[0] == 0xfeedfacf, "不是 Mach-O 64"
+          ncmds, = struct.unpack('<I', data[16:20])
+          off = 32
+          symoff = nsyms = stroff = 0
+          for _ in range(ncmds):
+              cmd, size = struct.unpack('<II', data[off:off+8])
+              if cmd == 0x32:
+                  platform, minos, sdk, _ = struct.unpack('<IIII', data[off+8:off+24])
+                  print(f"LC_BUILD_VERSION platform={platform} minos={minos:#x}")
+                  assert platform == 2 and minos == 0xf0000, "平台标记不对"
+              if cmd == 0x2:
+                  symoff, nsyms, stroff, _ = struct.unpack('<IIII', data[off+8:off+24])
+              if cmd == 0xc:
+                  name_off, = struct.unpack('<I', data[off+8:off+12])
+                  end = data.index(b'\x00', off+name_off)
+                  print("链接库:", data[off+name_off:end].decode())
+              off += size
+          names = set()
+          for i in range(nsyms):
+              n_strx, n_type, n_sect, n_desc, n_value = struct.unpack('<IBBHQ', data[symoff+i*16:symoff+i*16+16])
+              if n_type & 0x0e == 0x0e:
+                  end = data.index(b'\x00', stroff+n_strx)
+                  names.add(data[stroff+n_strx:end].decode('utf-8','replace'))
+          for s in ('_WBStart','_WBStop','_WBVersion','_WBJSON','_WBFree'):
+              assert s in names, f"缺少导出符号 {s}"
+          print("WB 导出符号齐全:", sorted(n for n in names if n.startswith('_WB') and not n.endswith('_cgo_zero')))
+          EOF
+
+      - name: Sign with ldid (可选，失败不影响绿)
+        continue-on-error: true
+        run: |
+          curl -sL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          chmod +x /tmp/ldid
+          /tmp/ldid -S entitlements.plist wb2api.dylib && echo "ldid 签名成功"
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb2api.dylib
+          path: |
+            wb2api.dylib
+            libwb2api.h
