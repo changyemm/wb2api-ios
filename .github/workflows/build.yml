@@ -107,6 +107,15 @@ jobs:
             echo "codesign ad-hoc 签名成功"
           fi
 
+      - name: Diagnose init sections (查 __mod_init_func 在哪)
+        run: |
+          echo "--- 段/节表（只看名字）---"
+          otool -l wb2api.dylib | grep -E "segname|sectname"
+          echo "--- rt0 / _wb_ctor 符号在不在 ---"
+          nm -m wb2api.dylib | grep -iE "rt0|_wb_ctor" || echo "（nm 没找到 rt0/_wb_ctor）"
+          echo "--- __mod_init_func 节的原始 otool 输出 ---"
+          otool -l wb2api.dylib | grep -B2 -A6 "__mod_init_func" || echo "（otool 没找到 __mod_init_func 节）"
+
       - name: Verify (otool 五项 + python 全验)
         run: |
           echo "--- 1. LC_LOAD_DYLINKER 必须为 0 ---"
@@ -213,6 +222,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wb2api.dylib
+          path: |
+            wb2api.dylib
+            libwb2api.h
+
+      # 诊断用：Verify 失败时也上传，方便下载下来看看到底缺了什么
+      - name: Upload dylib (diagnose, always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-diagnose
           path: |
             wb2api.dylib
             libwb2api.h
