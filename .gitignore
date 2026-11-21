@@ -61,6 +61,7 @@ server.exe
 /wb2api-macos.dylib
 /wb2api.dylib
 !README-iOS.md
+!internal/prompt/defaultprompt.md
 
 # Local build artifacts (local-45/build.sh 的产物，不进仓库)
 /local-45/dist/
