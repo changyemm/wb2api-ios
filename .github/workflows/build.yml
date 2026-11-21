@@ -1,18 +1,22 @@
 name: build-dylib
 
-# 构建单个 .dylib，全程 ubuntu-latest，无需 Apple SDK（2026-11-21 本机实测通过）：
-#   1. Go c-archive：GOOS=darwin + zig cc（zig 自带 Darwin 头文件）
-#   2. patch .a：逐成员 LC_BUILD_VERSION platform 1→2、minos→15.0
-#   3. 链接 tweak：zig cc -target aarch64-macos.11.0-none（zig 只给 macOS 11.0
-#      提供 libc；-gnu ABI 不行，要用 -none）+ sdk-stubs 里的
-#      CoreFoundation/Security .tbd（Go runtime 只要 20 个符号）
-#   4. patch dylib：LC_BUILD_VERSION platform 1→2、minos→15.0
-#   5. zsign ad-hoc 签名（必须成功；ldid 2.1.5 解析不了 zig 0.15.2 的
-#      Mach-O 输出——即使最小 dylib 也报 "Unknown header magic"，故弃用；
-#      另：zsign -e 对单个 dylib 写不出 entitlements（只会写空 dict），
-#      而 entitlements 是进程属性、由宿主 App 签名决定，dylib 自身带不带
-#      不影响加载，最终签名由白膜注入器负责；entitlements.plist 保留在仓
-#      库里供 Mac 端 codesign 手动用）→ artifact
+# 构建单个 .dylib，macos-latest + Apple clang（2026-11-22 改）：
+#   根因：GOOS=darwin 编的 Go runtime 带 macOS 独有符号
+#   （_notify_is_valid_token、_xpc_date_create_from_current，iOS 的
+#   libSystem 里没有；弱链接下加载失败是静默的——不崩、没日志、端口
+#   不通）。GOOS=ios + c-archive 是 gomobile bind -target=ios 的官
+#   方路线。仓库已公开，macOS runner 额度无限，不用 ubuntu+zig 了。
+#   步骤：GOOS=ios c-archive（xcrun clang wrapper）→ patch .a 兜底
+#   → Apple clang -Wl,-all_load 链 dylib → install_name_tool
+#   → ldid -S（brew 装不上就 codesign ad-hoc 兜底）→ otool 五项
+#   校验 + python 全验 → artifact
+#   注：zig 链不了 platform=2 的 .o（报 invalid platform:
+#   aarch64-ios），所以 Linux+zig 链接路线已废弃；Linux+zig 编
+#   GOOS=ios 归档本身是通的（2026-11-22 本机实测），只是链接必须
+#   用 Apple clang（或不改 .a、改最终 dylib 的平台标记）。
+#   注 2：链接时多加 -framework Security——Go runtime 引用 Security
+#   符号（darwin 产物实测 7 个 Sec 符号），只加 CoreFoundation 会
+#   链不上。
 on:
   push:
     branches: [main]
@@ -22,7 +26,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -32,12 +36,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install zig 0.15.2
+      - name: Xcode / iOS SDK 检查
         run: |
-          curl -sL -o /tmp/zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
-          echo "ZIG_INC=/tmp/zig-x86_64-linux-0.15.2/lib/libc/include/any-macos-any" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --find clang
 
       - name: Version (upstream 约定：上海时间 vYYYY.M.D.HMM)
         id: ver
@@ -56,34 +59,67 @@ jobs:
       - name: go test (上游单测)
         run: go test ./... 2>&1 | tail -30
 
-      - name: Build c-archive (darwin/arm64, cgo via zig)
+      - name: Build c-archive (GOOS=ios, xcrun clang)
         run: |
-          export CGO_ENABLED=1 GOOS=darwin GOARCH=arm64
-          export CC="zig cc -target aarch64-macos-gnu"
-          export CGO_CFLAGS="-I${ZIG_INC} -Wno-nullability-completeness"
+          cat > /tmp/ios-clang.sh <<'EOF'
+          #!/bin/sh
+          SDK=iphoneos
+          exec "$(xcrun --sdk $SDK --find clang)" \
+               -arch arm64 \
+               -isysroot "$(xcrun --sdk $SDK --show-sdk-path)" \
+               -miphoneos-version-min=14.0 "$@"
+          EOF
+          chmod +x /tmp/ios-clang.sh
+          export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
+          export CC=/tmp/ios-clang.sh
           go build -trimpath \
             -ldflags="-s -w -X main.appVersion=${{ steps.ver.outputs.version }}" \
             -buildmode=c-archive -o libwb2api.a ./cmd/carchive
           ls -l libwb2api.a libwb2api.h
 
-      - name: Patch archive platform macOS(1) -> iOS(2)
+      - name: Patch archive platform (兜底：正常应已是 iOS(2))
         run: |
           python3 scripts/patch_archive_platform.py libwb2api.a libwb2api-ios.a
           ls -l libwb2api-ios.a
 
-      - name: Link tweak dylib (zig cc, macOS 11.0-none + framework stubs)
+      - name: Link tweak dylib (Apple clang, -all_load)
         run: |
-          zig cc -target aarch64-macos.11.0-none \
-            -I"${ZIG_INC}" -Wno-nullability-completeness \
-            -dynamiclib -Wl,-install_name,@rpath/wb2api.dylib \
-            -F sdk-stubs/System/Library/Frameworks \
-            -framework CoreFoundation -framework Security \
-            -o wb2api-macos.dylib tweak/tweak.c libwb2api.a
-          python3 scripts/patch_dylib_platform.py wb2api-macos.dylib wb2api.dylib
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang -arch arm64 -dynamiclib \
+            -target arm64-apple-ios14.0 \
+            -isysroot "$SDK_PATH" \
+            -Wl,-all_load libwb2api-ios.a \
+            -framework CoreFoundation -framework Security -lresolv \
+            -o wb2api.dylib tweak/tweak.c
+          install_name_tool -id "@rpath/wb2api.dylib" wb2api.dylib
           ls -l wb2api.dylib
 
-      - name: Verify dylib (platform=2, WB 导出符号, 只链三个系统库)
+      - name: Sign (ldid -S, 装不上就 codesign ad-hoc 兜底)
         run: |
+          if ! command -v ldid >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ldid || true
+          fi
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S wb2api.dylib
+            echo "ldid 签名成功"
+          else
+            codesign --force --sign - wb2api.dylib
+            echo "codesign ad-hoc 签名成功"
+          fi
+
+      - name: Verify (otool 五项 + python 全验)
+        run: |
+          echo "--- 1. LC_LOAD_DYLINKER 必须为 0 ---"
+          test "$(otool -l wb2api.dylib | grep -c LC_LOAD_DYLINKER)" = "0"
+          echo "--- 2. LC_BUILD_VERSION platform 必须为 2 ---"
+          otool -l wb2api.dylib | grep -A3 LC_BUILD_VERSION
+          otool -l wb2api.dylib | grep -A3 LC_BUILD_VERSION | grep -q "platform 2"
+          echo "--- 3. __LLVM 必须为 0 ---"
+          test "$(otool -l wb2api.dylib | grep -c __LLVM)" = "0"
+          echo "--- 4. nm WBStart 必须有 ---"
+          nm -gU wb2api.dylib | grep WBStart
+          echo "--- 5. codesign 必须能正常显示 ---"
+          codesign -dv wb2api.dylib
           python3 - <<'EOF'
           import struct
           data = open('wb2api.dylib','rb').read()
@@ -96,7 +132,7 @@ jobs:
               if cmd == 0x32:
                   platform, minos, sdk, _ = struct.unpack('<IIII', data[off+8:off+24])
                   print(f"LC_BUILD_VERSION platform={platform} minos={minos:#x}")
-                  assert platform == 2 and minos == 0xf0000, "平台标记不对"
+                  assert platform == 2, "平台标记不对"
               if cmd == 0x2:
                   symoff, nsyms, stroff, _ = struct.unpack('<IIII', data[off+8:off+24])
               if cmd == 0xd:
@@ -119,16 +155,23 @@ jobs:
                   print("链接库:", data[off+name_off:end].decode())
               off += size
           names = set()
+          undef = set()
           for i in range(nsyms):
               n_strx, n_type, n_sect, n_desc, n_value = struct.unpack('<IBBHQ', data[symoff+i*16:symoff+i*16+16])
               if n_type & 0x0e == 0x0e:
                   end = data.index(b'\x00', stroff+n_strx)
                   names.add(data[stroff+n_strx:end].decode('utf-8','replace'))
+              if n_sect == 0 and (n_type & 0x0e) == 0x00 and (n_type & 0x01):
+                  end = data.index(b'\x00', stroff+n_strx)
+                  undef.add(data[stroff+n_strx:end].decode('utf-8','replace'))
           for s in ('_WBStart','_WBStop','_WBVersion','_WBJSON','_WBFree'):
               assert s in names, f"缺少导出符号 {s}"
           print("WB 导出符号齐全:", sorted(n for n in names if n.startswith('_WB') and not n.endswith('_cgo_zero')))
+          # GOOS=darwin 的产物带 macOS 独有符号，GOOS=ios 必须没有
+          for s in ('_notify_is_valid_token','_xpc_date_create_from_current'):
+              assert s not in undef, f"仍有 macOS 独有符号 {s}"
+          print("无 macOS 独有符号（_notify_is_valid_token、_xpc_date_create_from_current 均已消除）")
           # 初始化顺序：Go runtime 必须在 _wb_ctor 之前，否则构造器调 WBStart 会死锁
-          # （Linux 下 gcc 链接顺序产物曾复现过此问题；iOS 产物必须保证 rt0 在前）
           import bisect
           syms = []
           for i in range(nsyms):
@@ -160,16 +203,11 @@ jobs:
                       soff2 += 80
               off2 += size2
           print("mod_init_func 顺序:", order)
-          assert '__rt0_arm64_darwin_lib' in order and '_wb_ctor' in order, "初始化函数缺失"
-          assert order.index('__rt0_arm64_darwin_lib') < order.index('_wb_ctor'), "Go runtime 必须在 _wb_ctor 之前"
+          # GOOS=ios 的 runtime 入口是 __rt0_arm64_ios_lib，darwin 是 __rt0_arm64_darwin_lib
+          rt0 = [n for n in order if n.startswith('__rt0_arm64_') and n.endswith('_lib')]
+          assert rt0 and '_wb_ctor' in order, "初始化函数缺失"
+          assert order.index(rt0[0]) < order.index('_wb_ctor'), "Go runtime 必须在 _wb_ctor 之前"
           EOF
-
-      - name: Sign with zsign (ad-hoc, 必须成功)
-        run: |
-          curl -sL -o /tmp/zsign.tar.gz https://github.com/zhlynn/zsign/releases/download/v1.1.3/zsign-linux-x86_64.tar.gz
-          tar -xzf /tmp/zsign.tar.gz -C /tmp
-          /tmp/zsign -a wb2api.dylib
-          test -s wb2api.dylib && echo "zsign 签名成功"
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
