@@ -136,8 +136,16 @@ jobs:
           ncmds, = struct.unpack('<I', data[16:20])
           off = 32
           symoff = nsyms = stroff = 0
+          has_chained = False
+          has_infoonly = False
           for _ in range(ncmds):
               cmd, size = struct.unpack('<II', data[off:off+8])
+              # 注意：LC_REQ_DYLD 位（0x80000000）会置位，要先屏蔽再比
+              base_cmd = cmd & 0x7fffffff
+              if base_cmd == 0x34:
+                  has_chained = True
+              if base_cmd == 0x22:
+                  has_infoonly = True
               if cmd == 0x32:
                   platform, minos, sdk, _ = struct.unpack('<IIII', data[off+8:off+24])
                   print(f"LC_BUILD_VERSION platform={platform} minos={minos:#x}")
@@ -163,6 +171,10 @@ jobs:
                   end = data.index(b'\x00', off+name_off)
                   print("链接库:", data[off+name_off:end].decode())
               off += size
+          # 现代绑定：必须有 chained fixups，不能是老式 LC_DYLD_INFO_ONLY
+          assert has_chained, "缺 LC_DYLD_CHAINED_FIXUPS（现代绑定）"
+          assert not has_infoonly, "仍有老式 LC_DYLD_INFO_ONLY"
+          print("绑定方式：LC_DYLD_CHAINED_FIXUPS（现代），无 LC_DYLD_INFO_ONLY")
           names = set()
           undef = set()
           for i in range(nsyms):
@@ -181,6 +193,10 @@ jobs:
               assert s not in undef, f"仍有 macOS 独有符号 {s}"
           print("无 macOS 独有符号（_notify_is_valid_token、_xpc_date_create_from_current 均已消除）")
           # 初始化顺序：Go runtime 必须在 _wb_ctor 之前，否则构造器调 WBStart 会死锁
+          # 两种格式：老式 __mod_init_func（64 位指针）；新式 __init_offsets
+          # （Xcode 16+/ld_prime：__TEXT 里的 32 位偏移，相对镜像基址；
+          # 2026-11-22 Run #5/#6 因此红过——Apple clang 产物只有新式，
+          # 旧脚本只认老式，查出来是空列表）
           import bisect
           syms = []
           for i in range(nsyms):
@@ -196,6 +212,7 @@ jobs:
           ncmds2, = struct.unpack('<I', data[16:20])
           off2 = 32
           order = []
+          init_fmt = None
           for _ in range(ncmds2):
               cmd2, size2 = struct.unpack('<II', data[off2:off2+8])
               if cmd2 == 0x19:
@@ -204,14 +221,22 @@ jobs:
                   for i2 in range(nsects2):
                       sname2 = data[soff2:soff2+16].rstrip(b'\x00').decode()
                       if sname2 == '__mod_init_func':
+                          init_fmt = 'mod_init_func'
                           addr2, sz2 = struct.unpack('<QQ', data[soff2+32:soff2+48])
                           foff2, = struct.unpack('<I', data[soff2+48:soff2+52])
                           for j2 in range(sz2//8):
                               ptr2, = struct.unpack('<Q', data[foff2+j2*8:foff2+j2*8+8])
                               order.append(symname(ptr2))
+                      elif sname2 == '__init_offsets':
+                          init_fmt = 'init_offsets'
+                          addr2, sz2 = struct.unpack('<QQ', data[soff2+32:soff2+48])
+                          foff2, = struct.unpack('<I', data[soff2+48:soff2+52])
+                          for j2 in range(sz2//4):
+                              off32, = struct.unpack('<I', data[foff2+j2*4:foff2+j2*4+4])
+                              order.append(symname(off32))
                       soff2 += 80
               off2 += size2
-          print("mod_init_func 顺序:", order)
+          print(f"初始化函数格式: {init_fmt}，顺序:", order)
           # GOOS=ios 的 runtime 入口是 __rt0_arm64_ios_lib，darwin 是 __rt0_arm64_darwin_lib
           rt0 = [n for n in order if n.startswith('__rt0_arm64_') and n.endswith('_lib')]
           assert rt0 and '_wb_ctor' in order, "初始化函数缺失"
