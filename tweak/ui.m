@@ -36,6 +36,7 @@
 #import "ui.h"
 
 extern const char *WBAPIKey(void);
+extern const char *WBKeyPersistWarning(void); // #16：api_key 写盘失败的告警（"" = 无）
 extern void WBFree(const char *s);
 
 #define WB2API_PORT 7863
@@ -197,6 +198,15 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
         case 1:  self.status = WB2APIStatusRunning; self.pendingToast = @"反代已在运行"; break;
         case 2:  self.status = WB2APIStatusRunning; self.pendingToast = @"已有服务在跑（别的 App），本进程只当客户端"; break;
         default: self.status = WB2APIStatusStopped; self.pendingToast = @"反代启动失败，见 wb2api.log"; break;
+    }
+    // #16：api_key 写盘失败时告警（WBKeyPersistWarning 非空时追加到启动 toast）。
+    const char *cw = WBKeyPersistWarning();
+    if (cw) {
+        NSString *warn = [NSString stringWithUTF8String:cw];
+        WBFree(cw);
+        if (warn.length > 0) {
+            self.pendingToast = [self.pendingToast stringByAppendingFormat:@"（注意：%@）", warn];
+        }
     }
     [self updateBallColor];
     [self ensureInstalled];
@@ -609,6 +619,12 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
     if (ck) { key = [NSString stringWithUTF8String:ck]; WBFree(ck); }
     NSString *jsKey = [[key stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
         stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
+    // #16：api_key 写盘失败的告警（面板顶部横幅，非空才显示）。
+    NSString *warn = @"";
+    const char *cwarn = WBKeyPersistWarning();
+    if (cwarn) { warn = [NSString stringWithUTF8String:cwarn]; WBFree(cwarn); }
+    NSString *jsWarn = [[warn stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+        stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
     NSString *script =
         @"(function(){"
         @"  try{localStorage.setItem('wb2api.key','__KEY__');}catch(e){}"
@@ -629,12 +645,21 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
         @"      b.onclick=function(){window.webkit.messageHandlers.wb2api.postMessage({action:'toggleBall'});};"
         @"      nav.parentNode.insertBefore(b,nav.nextSibling);"
         @"    }"
+        @"    var warn='__WARN__';"
+        @"    if(warn&&!document.getElementById('wbKeyWarn')){"
+        @"      var d=document.createElement('div');"
+        @"      d.id='wbKeyWarn';d.textContent=warn;"
+        @"      d.style.cssText='background:#fff3cd;color:#856404;padding:8px 12px;margin:8px;border-radius:6px;font-size:13px;';"
+        @"      var m=document.querySelector('.main')||document.body;"
+        @"      if(m){m.insertBefore(d,m.firstChild);}"
+        @"    }"
         @"    try{window.__wb2apiOverflow=document.documentElement.scrollWidth>window.innerWidth;}catch(e){}"
         @"  }"
         @"  if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',inject);}"
         @"  else{inject();}"
         @"})();";
     script = [script stringByReplacingOccurrencesOfString:@"__KEY__" withString:jsKey];
+    script = [script stringByReplacingOccurrencesOfString:@"__WARN__" withString:jsWarn];
     WKUserScript *us = [[WKUserScript alloc] initWithSource:script
                                               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                            forMainFrameOnly:YES];
