@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -86,7 +87,8 @@ type runningServer struct {
 	balStarted  bool // bal.Start() 已调过（Stop 前未 Start 会死锁，见 teardown）
 	recStarted  bool
 	proxyCancel context.CancelFunc
-	proxiesDone chan struct{} // proxies.Run 退出时关闭（#8）
+	proxies     *proxypool.Manager // 代理池（⑥：teardown 里 Close，关 transport 空闲连接并置 m.closed）
+	proxiesDone chan struct{}     // proxies.Run 退出时关闭（#8）
 	schedCancel context.CancelFunc
 	schedDone   chan struct{} // sch.Run 退出时关闭（#1）
 	serveDone   chan struct{} // Serve goroutine 退出时关闭（#7/#9）
@@ -341,9 +343,20 @@ func (rs *runningServer) teardownImpl() {
 	if rs.p != nil {
 		rs.p.Close()
 	}
+	// ⑥：关代理池（只 cancel Run 不够：transport 空闲连接没关，m.closed 不置位）。
+	if rs.proxies != nil {
+		rs.proxies.Close()
+	}
 	if rs.up != nil && rs.up.HTTP != nil {
 		rs.up.HTTP.CloseIdleConnections()
 	}
+	// ⑦：停机时把面板日志环形缓冲落盘（上游 main.go:541 的 defer 等价物），
+	// 并把全局日志输出恢复成默认（避免写到已停面板的旧 ring）。
+	if rs.pn != nil {
+		rs.pn.Logs().Flush()
+	}
+	log.SetOutput(os.Stderr)
+	server.SetChatLogOutput(os.Stdout)
 }
 
 //export WBAPIKey
@@ -495,6 +508,11 @@ func startLocked(base string) (*runningServer, error) {
 	p.SetStore(store)
 	p.RestoreFromSnapshot()
 	p.SyncToDir(auths)
+	// ①②：上游默认值（config.go:713/717/1259-1261）。pool.New 不给默认值，
+	// 0 = 不限/关闭。单账号并发无上限易撞上游 6004/风控；保底 0 会把号打到 0 分。
+	p.SetMaxInFlight(3)       // 国内档
+	p.SetMaxInFlightGlobal(2) // 国际档（WAF 风控更紧）
+	p.SetReserveCredits(10)
 	rs.p = p
 
 	up := upstream.New() // 默认 node TLS 指纹（与 main() 一致）
@@ -550,6 +568,7 @@ func startLocked(base string) (*runningServer, error) {
 			log.Printf("[wb2api] proxy pool 不可用: %v", err)
 		} else {
 			proxies = pm
+			rs.proxies = proxies // ⑥：teardown 里 Close（只 cancel Run 不够）
 			// #A：经代理的 HTTPS 用与直连同一套 TLS 指纹与请求头顺序。
 			proxies.SetTLSOver(up.TLSOver)
 			// #A：把代理池挂到 upstream 客户端上，否则转发请求全部走直连，
@@ -570,7 +589,10 @@ func startLocked(base string) (*runningServer, error) {
 
 	// scheduler：余额采样记录器挂在余额刷新之后（nil = 不采样）。
 	// 默认排程：签到 9/21 点、旅行 9/21 点、活跃 10 点、保活 22 点、成长 11 点；面板手动签到/保活走它。
-	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up, Balance: bal})
+	// ⑤：启动补跑去重记录（上游 main.go:338）。不给则每次冷启动都全量补跑
+	// missedToday（签到/旅行/活跃/保活/成长）；iOS 冷启动是常态，风控暴露翻倍。
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up, Balance: bal,
+		RunStampFile: filepath.Join(dataDir, "sched-stamp.json")})
 	rs.sch = sch
 
 	// 配置页后端（④）：LoadConfig 回显当前生效值（Live 快照），SaveConfig 合并落盘 + 热应用。
@@ -607,6 +629,14 @@ func startLocked(base string) (*runningServer, error) {
 		ModelFallback:    func() map[string]string { return live.Load().ModelFallback },
 	})
 	rs.pn = pn
+
+	// ⑦：面板日志链路（上游 main.go:536-543）。不接则面板「运行日志」页永远空。
+	// SetTaskArchive 失败只记警告（上游同款处理），不影响启动。
+	if err := pn.Logs().SetTaskArchive(filepath.Join(dataDir, "task-logs.json")); err != nil {
+		log.Printf("WARN: task log archive: %v", err)
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
+	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	// #B：把面板的任务执行器注入调度器（上游 main.go:545-546）。
 	sch.SetGrowthRunner(pn.RunGrowthQueueNow)
@@ -650,6 +680,14 @@ func startLocked(base string) (*runningServer, error) {
 		BusyRetry:             true,
 		BusyWaitMax:           60 * time.Second,
 		Tasks:                 sch,
+		// ③：上游默认 passthrough（config.go:706）。留空会进 handler 的缺省 "custom"，
+		// 但 PromptText 为空 → 内容拦截的三层抢救全不生效，网关失败、网页版成功。
+		PromptMode: "passthrough",
+		PromptText: "",
+		// ④：上游默认 1.5s（config.go:1110-1111）。0 = 关闭，冷启动长首帧时客户端可能先超时。
+		HeadKeepalive: 1500 * time.Millisecond,
+		// ⑧：降级路由表（上游 main.go:575，与面板同款）。只传 panel 不传 handler 则降级不生效。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
 		// 静态字段与 Live 快照同值（Live 为 nil 时的回退；正常走 Live）。
 		TTSEnabled:            feats.TTSEnabled,
 		ASREnabled:            feats.ASREnabled,
