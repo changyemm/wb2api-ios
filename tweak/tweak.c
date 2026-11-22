@@ -61,7 +61,11 @@ static void wb_ctor(void) {
     if (stat(logpath, &st) == 0 && st.st_size > (1 << 20)) {
         char oldpath[1250];
         snprintf(oldpath, sizeof(oldpath), "%s.old", logpath);
-        rename(logpath, oldpath);
+        /* #17：rename 失败要记日志（不是静默忽略），否则轮转悄悄失效、日志会一直长下去。 */
+        if (rename(logpath, oldpath) != 0) {
+            os_log(OS_LOG_DEFAULT, "[wb2api] 日志轮转失败: errno=%{public}d", errno);
+            // 失败也不要阻止启动 —— 日志转不动不是致命问题
+        }
     }
     FILE *lf = freopen(logpath, "a", stderr);
     os_log(OS_LOG_DEFAULT, "[wb2api] freopen=%{public}s logpath=%{public}s", lf ? "ok" : "FAIL", logpath);
