@@ -19,6 +19,8 @@
 //     热生效、无需重启；用量/请求日志/余额趋势/积分历史/代理池记录器也已接线。
 //   - 数据目录不走相对路径：宿主 App 的 CWD 是只读的 app bundle，
 //     必须由 tweak 传绝对路径（NSHomeDirectory 下的 Library/WBPanel）。
+//   - 会话粘性：已接 session.Router（v1.2.6），进程内（Noop Redis）；
+//     重启后重新绑定，不跨进程恢复（上游用 Redis 恢复，手机上不需要）。
 package main
 
 /*
@@ -58,6 +60,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
 	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
 	"github.com/misakano7545/workbuddy2api-panel/internal/server"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
@@ -89,6 +92,7 @@ type runningServer struct {
 	proxyCancel context.CancelFunc
 	proxies     *proxypool.Manager // 代理池（⑥：teardown 里 Close，关 transport 空闲连接并置 m.closed）
 	proxiesDone chan struct{}     // proxies.Run 退出时关闭（#8）
+	sessRouter  *session.Router   // 会话粘性路由（v1.2.6：teardown 里 StopGC）
 	schedCancel context.CancelFunc
 	schedDone   chan struct{} // sch.Run 退出时关闭（#1）
 	serveDone   chan struct{} // Serve goroutine 退出时关闭（#7/#9）
@@ -301,6 +305,9 @@ func (rs *runningServer) teardown() {
 func (rs *runningServer) teardownImpl() {
 	if rs.schedCancel != nil {
 		rs.schedCancel()
+	}
+	if rs.sessRouter != nil {
+		rs.sessRouter.StopGC() // 会话粘性 GC 停掉（幂等；无 done 通道，不等它）
 	}
 	if rs.proxyCancel != nil {
 		rs.proxyCancel()
@@ -607,6 +614,20 @@ func startLocked(base string) (*runningServer, error) {
 		return saveMobileConfig(raw, configPath, filepath.Join(base, "api_key.txt"), live)
 	}
 
+	// 会话粘性路由（v1.2.6）：同一会话尽量绑定同一账号，多轮对话不跳号。
+	// 进程内粘性：Store 用已建的 Noop store（纯内存），LoadFromStore 是空操作；
+	// 重启后重新绑定（不跨进程恢复）。TTL/GCInterval 用上游默认值 30m/5m。
+	sessRouter := session.New(session.Config{
+		TTL:               30 * time.Minute,
+		GCInterval:        5 * time.Minute,
+		Store:             store,
+		Available:         p.AvailableUIDs,
+		AvailableForModel: realmAwareAvailableForModel(p),
+	})
+	sessRouter.LoadFromStore()
+	sessRouter.StartGC()
+	rs.sessRouter = sessRouter
+
 	pn := panel.New(panel.Config{
 		Pool:             p,
 		ProxyPool:        proxies,
@@ -626,6 +647,7 @@ func startLocked(base string) (*runningServer, error) {
 		SaveConfig:       saveCfg,
 		AutoTasksEnabled: sch.GrowthEnabled,
 		RescueToday:      server.RescueToday,
+		StickyCount:      sessRouter.Count,
 		ModelFallback:    func() map[string]string { return live.Load().ModelFallback },
 	})
 	rs.pn = pn
@@ -674,6 +696,8 @@ func startLocked(base string) (*runningServer, error) {
 		APIKey:                apiKey,
 		Panel:                 pn,
 		Live:                  live,
+		Session:               sessRouter,
+		StickyCount:           sessRouter.Count,
 		Usage:                 rec,
 		RequestLog:            requestLog,
 		GlobalEnabled:         true,
@@ -1001,6 +1025,18 @@ func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+// realmAwareAvailableForModel 会话粘性按模型可用口径的 realm 感知闭包。
+// 照抄 cmd/server/wiring.go（package main，不能 import，只能复制）。
+// 粘性分配的模型名可能带 realm 前缀（"global:gpt-5.4" / "cn:glm-5.2"）：
+// 必须按前缀剥出 realm + bareModel 再交给分池选号域过滤，否则裸名取池子全集，
+// global 号会被粘性分配给 CN 前缀请求（跨 realm 泄漏）。
+func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
+	return func(model string) []string {
+		realm, bare := server.ResolveModel(model)
+		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
+	}
 }
 
 func main() {}
