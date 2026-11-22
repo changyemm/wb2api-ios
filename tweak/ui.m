@@ -217,8 +217,10 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 
 /* ── ① 宿主窗口解析 ── */
 + (UIWindow *)keyOrNormalWindowInScene:(UIWindowScene *)scene {
+    // 两轮都只接受 windowLevel == Normal 的窗口：键盘、alert 等系统窗口
+    // （level 高于 Normal）可能成为 keyWindow，但不是宿主 App 的主窗口。
     for (UIWindow *w in scene.windows) {
-        if (w.isKeyWindow) return w;
+        if (w.isKeyWindow && !w.hidden && w.alpha > 0 && w.windowLevel == UIWindowLevelNormal) return w;
     }
     for (UIWindow *w in scene.windows) {
         if (!w.hidden && w.alpha > 0 && w.windowLevel == UIWindowLevelNormal) return w;
@@ -227,13 +229,18 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 }
 
 + (UIWindow *)resolveHostWindowWithScene:(UIWindowScene *)scene window:(UIWindow *)window {
-    // 1. 通知携带的 window（须属于前台 scene 才有效）。
+    // 1. 通知携带的 window：须属于前台 scene，且窗口本身有效（可见、不透明、Normal 层级）。
+    //    只查 scene 状态不够——键盘、alert 等系统窗口也可能挂在前台 scene 下。
     if (window && window.windowScene &&
-        window.windowScene.activationState == UISceneActivationStateForegroundActive) {
+        window.windowScene.activationState == UISceneActivationStateForegroundActive &&
+        !window.hidden && window.alpha > 0 &&
+        window.windowLevel == UIWindowLevelNormal) {
         return window;
     }
-    // 2. 通知携带的 scene。
-    if (scene) {
+    // 2. 通知携带的 scene：只接受前台（Active 或 Inactive）的 scene，
+    //    后台 scene 的窗口不能用（用户看不见，挂上去也没意义）。
+    if (scene && (scene.activationState == UISceneActivationStateForegroundActive ||
+                  scene.activationState == UISceneActivationStateForegroundInactive)) {
         UIWindow *w = [self keyOrNormalWindowInScene:scene];
         if (w) return w;
     }
@@ -336,15 +343,17 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
     if (gr != self.tripleTap || !self.hostWindow) return YES;
-    // hitTest 过滤：落在 UIControl/UITextField/UITextView/WKWebView 上不触发
-    // （避免在输入框、按钮、网页里三指双击误开面板）。
+    // hitTest 过滤：落在 UIControl/UITextField/UITextView 上不触发
+    // （避免在输入框、按钮上三指双击误开面板）。
+    // 注意：不要过滤 WKWebView——Minis 主界面可能就是全屏 WKWebView
+    // （src/ios/WebApp），一刀切会把三指双击这个主入口直接堵死；
+    // 三指双击不是 WKWebView 的标准手势（网页双击缩放是单指），不会误触。
     CGPoint p = [gr locationInView:self.hostWindow];
     UIView *hit = [self.hostWindow hitTest:p withEvent:nil];
     for (UIView *v = hit; v; v = v.superview) {
         if ([v isKindOfClass:[UIControl class]] ||
             [v isKindOfClass:[UITextField class]] ||
-            [v isKindOfClass:[UITextView class]] ||
-            [v isKindOfClass:[WKWebView class]]) {
+            [v isKindOfClass:[UITextView class]]) {
             return NO;
         }
     }
@@ -505,11 +514,10 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
         return;
     }
     if (self.panelVC) return; // 已打开。
-    // 打开前自检：上次查到服务停了就不开面板，直接提示（WKWebView 空白没意义）。
-    if (self.status == WB2APIStatusStopped) {
-        [self showToast:@"反代服务未启动，请看 wb2api.log"];
-        return;
-    }
+    // 注意：不要用上次异步自检的 Stopped 状态拦开面板——状态可能是旧的
+    // （服务后来已启动），而 return 在 runHealthCheck 之前，会形成
+    // 「Stopped → 不开面板 → 不自检 → 永远 Stopped」的死锁。
+    // 面板照常打开：服务真挂了，WKWebView 加载失败会弹 toast 提示。
     UIViewController *root = self.hostWindow.rootViewController;
     if (!root) {
         [self showToast:@"宿主界面还没好，稍后再试"];
@@ -520,7 +528,14 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
     vc.ui = self;
     vc.modalPresentationStyle = UIModalPresentationFullScreen; // 全屏，不可下滑关闭（关闭只走按钮）。
     self.panelVC = vc;
-    [root presentViewController:vc animated:YES completion:nil];
+    [root presentViewController:vc animated:YES completion:^{
+        // present 可能被拒（顶层 VC 正转场、不在窗口层级等）。若失败，
+        // presentingViewController 为 nil，必须清空 panelVC，否则后续
+        // openPanel 都在第一行 return，面板永久锁成「已打开」。
+        if (vc.presentingViewController == nil) {
+            if (self.panelVC == vc) self.panelVC = nil;
+        }
+    }];
     // 打开面板也是一次自检触发点（后台跑，不阻塞打开）。
     [self runHealthCheck];
 }
