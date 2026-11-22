@@ -652,6 +652,13 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 }
 
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    // 过滤 NSURLErrorCancelled (-999)：HTTP 4xx 处主动 Cancel 会连带触发
+    // 这个回调；-999 只是“本次导航被取消”，不是真正的加载失败，不弹 toast，
+    // 否则 HTTP 404 会连弹两次 toast，第二条还是错的（说“连不上”）。
+    if ([error.domain isEqualToString:NSURLErrorDomain] &&
+        error.code == NSURLErrorCancelled) {
+        return;
+    }
     // WKWebView 连 127.0.0.1 未在真机实证；若加载失败，提示用户用 Safari 打开局域网 IP。
     // 注意：toast 必须弹在面板自己的 view 上（见下方 showToast），不能走
     // WB2APIUI 的 hostWindow toast——全屏面板会把 hostWindow 上的 toast 盖住，
@@ -661,6 +668,11 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 }
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    // 同上：过滤 -999（主动 Cancel / 被新导航取代的连带回调）。
+    if ([error.domain isEqualToString:NSURLErrorDomain] &&
+        error.code == NSURLErrorCancelled) {
+        return;
+    }
     // 导航中途失败（provisional 已过、加载中途断掉），与上面同等处理。
     os_log(OS_LOG_DEFAULT, "[wb2api] 面板导航失败: %{public}@", error.localizedDescription);
     [self showToast:@"面板加载中途失败，试试 Safari 打开手机局域网 IP:7863/panel/"];
