@@ -107,16 +107,17 @@ CI（`.github/workflows/build.yml`，ubuntu-latest）跑同一套流程，
 
 ## v1 已知限制
 
-- 面板配置页返回 501（LoadConfig/SaveConfig 未接）：api_key 与监听地址
-  改不了，只能看面板、管账号、签到、看用量。v1.1 接一个小配置读写。
+- 面板配置页 v1.1 已接（LoadConfig/SaveConfig + Live 热更新）：能改 api_key
+  与 5 个 features 开关（TTS/ASR/Embeddings/去水印/3D），保存即生效、无需重启；
+  监听地址仍写死 0.0.0.0:7863，不可改。
 - 面板是桌面布局：390pt 手机屏上要横向拖。v1.1 在 tweak 的 WKWebView
   里用 WKUserScript 注入移动端 CSS/JS（参考 gan-jibamao 的
   assets/ios-mobile.css / ios-mobile.js 做法，不改上游前端）。
 - 无保活：宿主被挂起/杀掉，反代跟着停（符合产品定位，用户自己有越狱手段）。
 - 会话粘性关闭（Session=nil）：多轮对话靠客户端传完整 messages，
   账号按权重轮换。v1.1 可再开。
-- 用量记录、请求日志、余额趋势采样 v1 未接（对应面板接口返回 501），
-  不影响接单与签到。
+- 用量记录、请求日志、余额趋势、积分历史、代理池 v1.1 已接（对应面板接口
+  不再 501）；模型探针已给路径，但手机上无探测脚本，数据为空。
 
 ## 已知风险（用户已接受）
 
