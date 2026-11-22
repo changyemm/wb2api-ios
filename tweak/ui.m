@@ -256,10 +256,14 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
             if (w) return w;
         }
     }
-    // 4. 自己持有的 lastHostWindow（校验仍有效：还在 connectedScenes 里、未隐藏）。
+    // 4. 自己持有的 lastHostWindow（校验仍有效：还在 connectedScenes 里，
+    //    且是前台 scene、未隐藏、不透明、Normal 层级——与上面分支同标准）。
     WB2APIUI *ui = [WB2APIUI shared];
     UIWindow *last = ui.hostWindow;
-    if (last && last.windowScene && !last.hidden) {
+    if (last && last.windowScene && !last.hidden && last.alpha > 0 &&
+        last.windowLevel == UIWindowLevelNormal &&
+        (last.windowScene.activationState == UISceneActivationStateForegroundActive ||
+         last.windowScene.activationState == UISceneActivationStateForegroundInactive)) {
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
             if (s == last.windowScene) return last;
         }
@@ -291,6 +295,9 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
             self.ballContainer.frame = w.bounds;
             [w addSubview:self.ballContainer];
         }
+        // #1：同窗口也要自检。回前台最常见的就是同一窗口，不调的话
+        // 服务恢复了球还红；10 秒节流还在，不会多耗。
+        [self runHealthCheck];
         return;
     }
     // 窗口变了：从旧窗口移除，装到新窗口。
@@ -563,7 +570,11 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
       didReceiveScriptMessage:(WKScriptMessage *)message {
     if (![message.name isEqualToString:@"wb2api"]) return;
     if (![message.body isKindOfClass:[NSDictionary class]]) return;
-    NSString *action = message.body[@"action"];
+    // #11：action 必须先校验是 NSString。message.body[@"action"] 可能返回
+    // NSNull/NSNumber/NSDictionary，给 NSNull 发 isEqualToString: 会
+    // unrecognized selector 直接崩（和递归闪退同一类：缺防御性检查）。
+    id action = message.body[@"action"];
+    if (![action isKindOfClass:[NSString class]]) return;
     if ([action isEqualToString:@"toggleBall"]) {
         [self toggleBall];
     }
@@ -659,6 +670,24 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
             os_log(OS_LOG_DEFAULT, "[wb2api] 面板横向溢出（scrollWidth>innerWidth），移动端 CSS 需再调");
         }
     }];
+    // #4：同步悬浮球按钮初始文字。注入脚本里写死的是“● 悬浮球：开”，
+    // 若球当前是关的，首次打开面板会显示相反；这里按实际状态纠正一次。
+    WB2APIUI *ui = self.ui;
+    if (ui) {
+        NSString *js = [NSString stringWithFormat:
+            @"var b=document.getElementById('wbBallBtn');"
+            @"if(b){b.textContent='%@';}",
+            ui.ballVisible ? @"● 悬浮球：开" : @"○ 悬浮球：关"];
+        [webView evaluateJavaScript:js completionHandler:nil];
+    }
+}
+
+- (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
+    // #12：iOS 会因内存压力杀掉 WKWebView 的 WebContent 进程，不处理就永久白屏。
+    // 自动重载即可（注入脚本在 configuration 里，重载后照常注入）。
+    os_log(OS_LOG_DEFAULT, "[wb2api] WebContent 进程被终止，重新加载面板");
+    [self showToast:@"面板内核重启中…"];
+    [webView reload];
 }
 
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
@@ -689,6 +718,12 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 }
 
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationResponse:(WKNavigationResponse *)navigationResponse decisionHandler:(void (^)(WKNavigationResponsePolicy))decisionHandler {
+    // #6：只拦主 frame。这个回调对子资源（theme.js/app.js/favicon）也会触发，
+    // 子资源 4xx 时误 Cancel 会把面板弄坏，还弹错 toast。
+    if (!navigationResponse.isForMainFrame) {
+        decisionHandler(WKNavigationResponsePolicyAllow);
+        return;
+    }
     // HTTP 4xx/5xx 不会触发上面两个失败回调（WKWebView 认为导航“成功”，
     // 只是加载了一个错误页）。这里拦下来：状态码 >= 400 就弹 toast 并取消加载，
     // 避免用户对着服务器的错误页发愣。

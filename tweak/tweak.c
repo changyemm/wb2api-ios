@@ -55,6 +55,14 @@ static void wb_ctor(void) {
        不用 system()：它在 iOS 头文件里被标为不可用。 */
     int mk = mkdir(g_base, 0755);
     os_log(OS_LOG_DEFAULT, "[wb2api] mkdir=%{public}d errno=%{public}d (EEXIST=17 表示目录已在)", mk, errno);
+    /* #5 日志轮转：文件超 1MB 就转成 .old，避免无限增长。
+       注意：NSLog 也写 stderr，所以 Minis 全进程的日志都进这个文件。 */
+    struct stat st;
+    if (stat(logpath, &st) == 0 && st.st_size > (1 << 20)) {
+        char oldpath[1250];
+        snprintf(oldpath, sizeof(oldpath), "%s.old", logpath);
+        rename(logpath, oldpath);
+    }
     FILE *lf = freopen(logpath, "a", stderr);
     os_log(OS_LOG_DEFAULT, "[wb2api] freopen=%{public}s logpath=%{public}s", lf ? "ok" : "FAIL", logpath);
 

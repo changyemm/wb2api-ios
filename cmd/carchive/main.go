@@ -66,12 +66,13 @@ var appVersion = "ios-0.1.0"
 const listenAddr = "0.0.0.0:7863"
 
 type runningServer struct {
-	srv       *http.Server
-	p         *pool.Pool
-	startedAt time.Time
-	apiKey    string
-	live      *livecfg.Holder // 热配置持有者（面板改 api_key 后，WBAPIKey 读它拿当前值）
-	lastErr   string
+	srv         *http.Server
+	p           *pool.Pool
+	startedAt   time.Time
+	apiKey      string
+	live        *livecfg.Holder // 热配置持有者（面板改 api_key 后，WBAPIKey 读它拿当前值）
+	lastErr     string
+	proxyCancel context.CancelFunc // #8：取消代理池后台任务（WBStop / 启动超时回滚时调）
 }
 
 var (
@@ -125,6 +126,9 @@ func WBStop() C.int {
 	defer mu.Unlock()
 	if cur == nil || cur.srv == nil {
 		return 1
+	}
+	if cur.proxyCancel != nil {
+		cur.proxyCancel()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -207,7 +211,10 @@ func startLocked(base string) error {
 		return fmt.Errorf("建 data 目录失败: %w", err)
 	}
 
-	apiKey := resolveAPIKey(base)
+	apiKey, err := resolveAPIKey(base)
+	if err != nil {
+		return fmt.Errorf("resolve api_key: %w", err)
+	}
 
 	auths, err := auth.LoadDir(authDir)
 	if err != nil {
@@ -261,12 +268,17 @@ func startLocked(base string) error {
 	up.SetCreditObserver(creditHist.Observe)
 	// 代理池：失败只记日志、不影响启动（面板代理接口届时回空集）。
 	var proxies *proxypool.Manager
+	var proxyCancel context.CancelFunc
 	if baseTr, ok := up.HTTP.Transport.(*http.Transport); ok {
 		if pm, err := proxypool.New(filepath.Join(dataDir, "proxy-pool.json"), baseTr, upstream.NewDNSDialer(nil)); err != nil {
 			log.Printf("[wb2api] proxy pool 不可用: %v", err)
 		} else {
 			proxies = pm
-			go proxies.Run(context.Background())
+			// #8：用可取消的 context（不要 Background），WBStop / 启动超时回滚时取消，
+			// 否则后台任务永不停止，重启还会再起一个、共用同一个 proxy-pool.json。
+			proxyCtx, cancel := context.WithCancel(context.Background())
+			proxyCancel = cancel
+			go proxies.Run(proxyCtx)
 		}
 	}
 
@@ -334,7 +346,7 @@ func startLocked(base string) error {
 		Handler:           gw,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	cur = &runningServer{srv: srv, p: p, startedAt: time.Now(), apiKey: apiKey, live: live}
+	cur = &runningServer{srv: srv, p: p, startedAt: time.Now(), apiKey: apiKey, live: live, proxyCancel: proxyCancel}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			mu.Lock()
@@ -355,6 +367,9 @@ func startLocked(base string) error {
 		}
 		if time.Now().After(deadline) {
 			_ = srv.Close()
+			if proxyCancel != nil {
+				proxyCancel()
+			}
 			cur = nil
 			return fmt.Errorf("7863 在 3 秒内未起来: %v", err)
 		}
@@ -367,23 +382,28 @@ func startLocked(base string) error {
 
 // resolveAPIKey：环境变量 WB2A_API_KEY > <base>/api_key.txt > 首次随机生成并落盘。
 // 空 key = 网关完全不鉴权；监听 0.0.0.0 时绝不能空，所以没有就生成一个。
-func resolveAPIKey(base string) string {
+// #9：rand 失败时返回错误（fail closed），绝不用硬编码的公开密钥——
+// 局域网可达的服务用公开密钥等于不鉴权。
+func resolveAPIKey(base string) (string, error) {
 	if k := strings.TrimSpace(os.Getenv("WB2A_API_KEY")); k != "" {
-		return k
+		return k, nil
 	}
 	keyFile := filepath.Join(base, "api_key.txt")
 	if b, err := os.ReadFile(keyFile); err == nil {
 		if k := strings.TrimSpace(string(b)); k != "" {
-			return k
+			return k, nil
 		}
 	}
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
-		return "wb2api-mobile-key"
+		return "", fmt.Errorf("生成随机 api_key 失败: %w", err)
 	}
 	k := hex.EncodeToString(buf[:])
-	_ = os.WriteFile(keyFile, []byte(k+"\n"), 0o600)
-	return k
+	if err := os.WriteFile(keyFile, []byte(k+"\n"), 0o600); err != nil {
+		// 写盘失败不致命：内存里的 key 仍可用，只是下次启动会重新生成；记日志即可。
+		log.Printf("[wb2api] api_key 写盘失败（下次启动会重新生成）: %v", err)
+	}
+	return k, nil
 }
 
 func maskKey(k string) string {
@@ -509,9 +529,13 @@ func saveMobileConfig(raw []byte, configPath, keyFile string, live *livecfg.Hold
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 	// api_key 同步写 api_key.txt（重启时的唯一来源）。
+	// #10：写失败要返回错误，不能静默忽略——否则 config.json 已是新 key、
+	// api_key.txt 还是旧 key，重启后用回旧 key，面板显示与实际分叉。
 	if v, ok := merged["api_key"]; ok {
 		if k, ok := v.(string); ok && strings.TrimSpace(k) != "" {
-			_ = os.WriteFile(keyFile, []byte(strings.TrimSpace(k)+"\n"), 0o600)
+			if err := os.WriteFile(keyFile, []byte(strings.TrimSpace(k)+"\n"), 0o600); err != nil {
+				return nil, fmt.Errorf("write api_key.txt: %w", err)
+			}
 		}
 	}
 	// 热应用：从当前快照出发，只覆盖 api_key 与 features（缺失键保留现值）。
