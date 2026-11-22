@@ -14,6 +14,8 @@
  * 数据目录：$HOME/Library/WBPanel（iOS 上 HOME 即 App 容器）。
  * 可用环境变量 WB2API_BASE_DIR 覆盖（调试用）。
  */
+#include <errno.h>
+#include <os/log.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +34,9 @@ __attribute__((constructor))
 static void wb_ctor(void) {
     const char *home = getenv("HOME");
     const char *override = getenv("WB2API_BASE_DIR");
+    /* 诊断用系统日志：即使文件日志建不出来，也能用 idevicesyslog 看到。
+       %{public} 必不可少，否则动态内容会被统一日志涂黑成 <private>。 */
+    os_log(OS_LOG_DEFAULT, "[wb2api] ctor start, HOME=%{public}s", home ? home : "(null)");
     if (override && override[0]) {
         snprintf(g_base, sizeof(g_base), "%s", override);
     } else if (home && home[0]) {
@@ -39,17 +44,20 @@ static void wb_ctor(void) {
     } else {
         snprintf(g_base, sizeof(g_base), "/tmp/wb2api");
     }
+    os_log(OS_LOG_DEFAULT, "[wb2api] baseDir=%{public}s", g_base);
 
     /* Go 的 log 走 stderr：重定向到文件，手机上才能排障。 */
     char logpath[1200];
     snprintf(logpath, sizeof(logpath), "%s/wb2api.log", g_base);
     /* 先确保目录存在（WBStart 里也会建，这里为了日志文件先行）。
        不用 system()：它在 iOS 头文件里被标为不可用。 */
-    (void)mkdir(g_base, 0755);
+    int mk = mkdir(g_base, 0755);
+    os_log(OS_LOG_DEFAULT, "[wb2api] mkdir=%{public}d errno=%{public}d (EEXIST=17 表示目录已在)", mk, errno);
     FILE *lf = freopen(logpath, "a", stderr);
-    (void)lf;
+    os_log(OS_LOG_DEFAULT, "[wb2api] freopen=%{public}s logpath=%{public}s", lf ? "ok" : "FAIL", logpath);
 
     int rc = WBStart(g_base);
+    os_log(OS_LOG_DEFAULT, "[wb2api] WBStart=%{public}d (0=本次启动 1=已启动 2=已有服务 -2=失败)", rc);
     fprintf(stderr, "[wb2api-tweak] WBStart(%s) = %d (%s)\n",
             g_base, rc,
             rc == 0 ? "本次启动" : rc == 1 ? "已启动" : rc == 2 ? "已有服务，只当客户端" : "启动失败");
