@@ -22,6 +22,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ui.h"
+
 extern int WBStart(const char *baseDir);
 extern int WBStop(void);
 extern const char *WBVersion(void);
@@ -61,6 +63,10 @@ static void wb_ctor(void) {
     fprintf(stderr, "[wb2api-tweak] WBStart(%s) = %d (%s)\n",
             g_base, rc,
             rc == 0 ? "本次启动" : rc == 1 ? "已启动" : rc == 2 ? "已有服务，只当客户端" : "启动失败");
+    /* 原生 UI（v1.1）：三指双击手势、悬浮球、WKWebView 面板、状态自检。
+       构造器可能不在主线程，ui 内部会切到主线程；此时窗口可能还没建好，
+       install 只注册通知、记下 toast，等窗口出现再挂载。 */
+    wb2api_ui_install(rc);
 }
 
 __attribute__((destructor))

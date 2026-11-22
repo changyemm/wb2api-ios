@@ -85,12 +85,17 @@ jobs:
       - name: Link tweak dylib (Apple clang, -all_load)
         run: |
           SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          # ui.m（ObjC，ARC）：手势/悬浮球/WKWebView 面板。单独编（-fobjc-arc 只作用于 .m）。
+          xcrun --sdk iphoneos clang -arch arm64 \
+            -target arm64-apple-ios14.0 \
+            -isysroot "$SDK_PATH" \
+            -fobjc-arc -c tweak/ui.m -o ui.o
           xcrun --sdk iphoneos clang -arch arm64 -dynamiclib \
             -target arm64-apple-ios14.0 \
             -isysroot "$SDK_PATH" \
             -Wl,-all_load libwb2api-ios.a \
-            -framework CoreFoundation -framework Security -lresolv \
-            -o wb2api.dylib tweak/tweak.c
+            -framework CoreFoundation -framework Security -framework UIKit -framework WebKit -lresolv \
+            -o wb2api.dylib tweak/tweak.c ui.o
           install_name_tool -id "@rpath/wb2api.dylib" wb2api.dylib
           ls -l wb2api.dylib
 
@@ -127,6 +132,8 @@ jobs:
           test "$(otool -l wb2api.dylib | grep -c __LLVM)" = "0"
           echo "--- 4. nm WBStart 必须有 ---"
           nm -gU wb2api.dylib | grep WBStart
+          echo "--- 4b. UIKit/WebKit 必须链上（v1.1 原生 UI）---"
+          otool -L wb2api.dylib | grep -q "UIKit.framework" && otool -L wb2api.dylib | grep -q "WebKit.framework"
           echo "--- 5. codesign 必须能正常显示 ---"
           codesign -dv wb2api.dylib
           python3 - <<'EOF'
@@ -185,7 +192,7 @@ jobs:
               if n_sect == 0 and (n_type & 0x0e) == 0x00 and (n_type & 0x01):
                   end = data.index(b'\x00', stroff+n_strx)
                   undef.add(data[stroff+n_strx:end].decode('utf-8','replace'))
-          for s in ('_WBStart','_WBStop','_WBVersion','_WBJSON','_WBFree'):
+          for s in ('_WBStart','_WBStop','_WBVersion','_WBJSON','_WBFree','_WBAPIKey'):
               assert s in names, f"缺少导出符号 {s}"
           print("WB 导出符号齐全:", sorted(n for n in names if n.startswith('_WB') and not n.endswith('_cgo_zero')))
           # GOOS=darwin 的产物带 macOS 独有符号，GOOS=ios 必须没有

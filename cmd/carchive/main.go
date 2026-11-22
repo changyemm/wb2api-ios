@@ -70,6 +70,7 @@ type runningServer struct {
 	p         *pool.Pool
 	startedAt time.Time
 	apiKey    string
+	live      *livecfg.Holder // 热配置持有者（面板改 api_key 后，WBAPIKey 读它拿当前值）
 	lastErr   string
 }
 
@@ -133,6 +134,22 @@ func WBStop() C.int {
 	}
 	cur = nil
 	return 0
+}
+
+//export WBAPIKey
+// WBAPIKey 返回当前生效的访问密钥（Live 快照；面板改完 key 后这里即新值）。
+// 供 tweak 的 WKWebView 注入 localStorage（wb2api.key），面板免输密钥。
+// 调用方用 WBFree 释放；服务未启动时返回空串。
+func WBAPIKey() *C.char {
+	mu.Lock()
+	defer mu.Unlock()
+	if cur != nil && cur.live != nil {
+		return C.CString(cur.live.Load().APIKey)
+	}
+	if cur != nil {
+		return C.CString(cur.apiKey)
+	}
+	return C.CString("")
 }
 
 //export WBVersion
@@ -317,7 +334,7 @@ func startLocked(base string) error {
 		Handler:           gw,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	cur = &runningServer{srv: srv, p: p, startedAt: time.Now(), apiKey: apiKey}
+	cur = &runningServer{srv: srv, p: p, startedAt: time.Now(), apiKey: apiKey, live: live}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			mu.Lock()
