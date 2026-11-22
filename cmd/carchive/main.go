@@ -164,7 +164,7 @@ func WBStart(baseDir *C.char) (rc C.int) {
 	// v1.2.7：串行化启动。startMu 保证同一时间只有一个 WBStart 在装配
 	// （两个同时调都会看到 cur==nil、都跑 startLocked，一个 EADDRINUSE，
 	// 失败方 teardown 会把全局日志输出恢复成 stderr，破坏成功方的面板日志）。
-	// 锁顺序：先 startMu 再 mu，全程一致，不死锁。WBStop 不碰 startMu。
+	// 锁顺序：先 startMu 再 mu，全程一致，不死锁。WBStop 也持 startMu（v1.2.8），同顺序，不反转。
 	startMu.Lock()
 	defer startMu.Unlock()
 	// #4：panic 隔离。Go 侧任何 panic 都不能穿到宿主 App。
@@ -226,8 +226,8 @@ func WBStart(baseDir *C.char) (rc C.int) {
 	}
 
 	// 先装 cur（只做状态切换），再等端口（不持锁，#10）。
-	// 装在前面的原因：等待期间 WBStop 能找到它并停掉；若先等后装，
-	// 等待期间 WBStop 会以为没在跑而漏停。
+	// 装在前面的原因：超时回滚靠 cur==rs 判断、WBStop 靠 cur 找到它；
+	// 若先等后装，这两处都会以为没在跑而漏处理。
 	mu.Lock()
 	if cur != nil && cur.srv != nil {
 		// 另一个 WBStart 抢先装好了（理论上不会，构造器只调一次）。
@@ -240,8 +240,8 @@ func WBStart(baseDir *C.char) (rc C.int) {
 
 	// 端口等待（不持锁，#10）：确认端口真正起来（最多 3 秒）。
 	if err := waitPortUp(3 * time.Second); err != nil {
-		// 超时回滚。WBStop 可能已在等待期间把它停掉（cur 已不是 rs），
-		// 那时不用再拆；否则自己拆（teardown 幂等，重复调也安全）。
+		// 超时回滚。v1.2.8 起 WBStop 持 startMu，不会在等待期间介入，
+		// 故 cur 恒为 rs；这里仍按 cur==rs 判断（防御性，teardown 幂等）。
 		mu.Lock()
 		mine := cur == rs
 		if mine {
@@ -279,6 +279,16 @@ func waitPortUp(d time.Duration) error {
 //export WBStop
 // WBStop 停止网关（宿主退出时调用；0=已停，1=本来就没跑）。
 func WBStop() (rc C.int) {
+	// v1.2.8：与 WBStart 同一个 startMu 串行化。否则并发场景会丢停止：
+	// WBStart 装配中（持 startMu）时 WBStop 看到 cur==nil 返回 1，
+	// WBStart 随后装好 cur 返回 0——调用方已执行过停止，服务却又起来了。
+	// 先等正在进行的启动完成，再取走 cur 并清理。锁顺序先 startMu 再 mu，
+	// 与 WBStart 一致，不死锁（WBStart 不会在持 mu 时等 WBStop，
+	// teardown 在 mu 外执行，Serve goroutine 仍能拿 mu 写状态）。
+	// 注意：teardown 可能很慢（Shutdown 最长 5 秒），期间 WBStart 会被阻塞——
+	// 这是期望行为（避免停完又起的竞态），不是性能问题。
+	startMu.Lock()
+	defer startMu.Unlock()
 	// #4：panic 隔离。
 	defer func() {
 		if r := recover(); r != nil {
