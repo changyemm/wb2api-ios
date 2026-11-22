@@ -407,7 +407,17 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 }
 
 - (void)setBallVisible:(BOOL)visible {
-    self.ballVisible = visible;
+    // 防御：调用方之一是 WKScriptMessageHandler（面板按钮回调），
+    // WebKit 实际在主线程回调，但文档未明确保障；这里兜底切回主线程，
+    // 保证下面的 addSubview/removeFromSuperview/evaluateJavaScript 都在主线程。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self setBallVisible:visible]; });
+        return;
+    }
+    // 注意：这里必须直接写 ivar `_ballVisible`，绝不能写 `self.ballVisible =`——
+    // 后者等价于 `[self setBallVisible:]`，就是本方法自己，会无限递归栈溢出
+    // （2026-11-22 真机闪退根因：点面板「悬浮球」开关直接崩，栈里同一地址重复 14 层）。
+    _ballVisible = visible;
     [[NSUserDefaults standardUserDefaults] setBool:visible forKey:kBallVisibleKey];
     if (visible) {
         if (self.hostWindow && self.ballContainer.superview != self.hostWindow) {
