@@ -513,7 +513,15 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self openPanel]; });
         return;
     }
-    if (self.panelVC) return; // 已打开。
+    // 入口兜底（Bug 3 根治）：panelVC 非 nil 不等于面板真的开着。
+    // present 被拒时 completion 通常根本不会调用，所以不能只靠它清理。
+    // 若 panelVC 既没在呈现（presentingViewController 为 nil）也没在
+    // 转场中（isBeingPresented 为 NO），说明上次 present 未成功，
+    // 清掉陈旧引用，允许这次重试；反之面板确实开着/正在开，直接 return。
+    if (self.panelVC) {
+        if (self.panelVC.presentingViewController || self.panelVC.isBeingPresented) return;
+        self.panelVC = nil;
+    }
     // 注意：不要用上次异步自检的 Stopped 状态拦开面板——状态可能是旧的
     // （服务后来已启动），而 return 在 runHealthCheck 之前，会形成
     // 「Stopped → 不开面板 → 不自检 → 永远 Stopped」的死锁。
@@ -645,8 +653,71 @@ typedef NS_ENUM(NSInteger, WB2APIStatus) {
 
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
     // WKWebView 连 127.0.0.1 未在真机实证；若加载失败，提示用户用 Safari 打开局域网 IP。
+    // 注意：toast 必须弹在面板自己的 view 上（见下方 showToast），不能走
+    // WB2APIUI 的 hostWindow toast——全屏面板会把 hostWindow 上的 toast 盖住，
+    // 用户只看到白屏，什么提示都没有。
     os_log(OS_LOG_DEFAULT, "[wb2api] 面板加载失败: %{public}@", error.localizedDescription);
-    [[WB2APIUI shared] showToast:@"面板打不开（WKWebView 连不上 127.0.0.1），试试 Safari 打开手机局域网 IP:7863/panel/"];
+    [self showToast:@"面板打不开（WKWebView 连不上 127.0.0.1），试试 Safari 打开手机局域网 IP:7863/panel/"];
+}
+
+- (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
+    // 导航中途失败（provisional 已过、加载中途断掉），与上面同等处理。
+    os_log(OS_LOG_DEFAULT, "[wb2api] 面板导航失败: %{public}@", error.localizedDescription);
+    [self showToast:@"面板加载中途失败，试试 Safari 打开手机局域网 IP:7863/panel/"];
+}
+
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationResponse:(WKNavigationResponse *)navigationResponse decisionHandler:(void (^)(WKNavigationResponsePolicy))decisionHandler {
+    // HTTP 4xx/5xx 不会触发上面两个失败回调（WKWebView 认为导航“成功”，
+    // 只是加载了一个错误页）。这里拦下来：状态码 >= 400 就弹 toast 并取消加载，
+    // 避免用户对着服务器的错误页发愣。
+    NSHTTPURLResponse *resp = nil;
+    if ([navigationResponse.response isKindOfClass:[NSHTTPURLResponse class]]) {
+        resp = (NSHTTPURLResponse *)navigationResponse.response;
+    }
+    if (resp && resp.statusCode >= 400) {
+        os_log(OS_LOG_DEFAULT, "[wb2api] 面板 HTTP 错误: %{public}ld", (long)resp.statusCode);
+        [self showToast:[NSString stringWithFormat:@"面板加载失败（HTTP %ld），请检查反代服务", (long)resp.statusCode]];
+        decisionHandler(WKNavigationResponsePolicyCancel);
+        return;
+    }
+    decisionHandler(WKNavigationResponsePolicyAllow);
+}
+
+// 面板内 toast：弹在面板自己的 view 上（全屏面板盖住 hostWindow，
+// 走 WB2APIUI 的 showToast 用户看不到）。样式与 hostWindow toast 一致，
+// 居中显示（盖在空白 webView 之上，不挡顶部的关闭按钮）。
+- (void)showToast:(NSString *)msg {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self showToast:msg]; });
+        return;
+    }
+    UILabel *label = [[UILabel alloc] init];
+    label.text = msg;
+    label.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+    label.textColor = [UIColor whiteColor];
+    label.font = [UIFont systemFontOfSize:14];
+    label.textAlignment = NSTextAlignmentCenter;
+    label.numberOfLines = 0;
+    label.layer.cornerRadius = 8;
+    label.clipsToBounds = YES;
+    CGFloat width = MIN(self.view.bounds.size.width - 40, 340);
+    CGSize size = [label sizeThatFits:CGSizeMake(width - 24, CGFLOAT_MAX)];
+    label.frame = CGRectMake((self.view.bounds.size.width - width) / 2,
+                             (self.view.bounds.size.height - (size.height + 16)) / 2,
+                             width, size.height + 16);
+    label.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin |
+        UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+    [self.view addSubview:label];
+    // 把 toast 提到最上层（盖在 webView 之上），但不挡关闭按钮（toast 居中，关闭在顶部）。
+    [self.view bringSubviewToFront:label];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.3 animations:^{
+            label.alpha = 0;
+        } completion:^(BOOL f) {
+            [label removeFromSuperview];
+        }];
+    });
 }
 
 - (void)dealloc {
