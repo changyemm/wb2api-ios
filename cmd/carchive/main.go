@@ -200,6 +200,19 @@ func startLocked(base string) error {
 
 	up := upstream.New() // 默认 node TLS 指纹（与 main() 一致）
 
+	// v1.1：features 默认全开（用户要求；手机上没有配置页可改，只能默认开）。
+	// <baseDir>/config.json 的 features 节可逐项覆盖（缺省即开；文件不存在/解析失败则全开）。
+	feats := loadMobileFeatures(base)
+	log.Printf("[wb2api] features: tts=%v asr=%v embeddings=%v watermark_strip=%v 3d=%v",
+		feats.TTSEnabled, feats.ASREnabled, feats.EmbeddingsEnabled, feats.WatermarkStripEnabled, feats.ThreeDEnabled)
+	// 3D 要能真正跑起来，只开开关不够，还得接凭证来源（否则报 503 无凭证）：
+	// 走自动签发（与上游默认 three_d_auto_token=true 一致），用账号自己的 access token
+	// 换 ck_t_；静态凭证表为空（手机上无处配）。静态 API Key 账号（ck_/pt_ 前缀）签不出来，
+	// 上游会自动跳过并回 503，属上游行为。
+	if feats.ThreeDEnabled {
+		up.ThreeDCredential = upstream.NewAutoThreeDCredentials(up.FetchClientTempKey, upstream.NewStaticThreeDCredentials(nil))
+	}
+
 	// scheduler 空 Config 即用默认排程：签到 9/21 点、旅行 9/21 点、
 	// 活跃 10 点、保活 22 点、成长 11 点；面板手动签到/保活走它。
 	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
@@ -216,13 +229,20 @@ func startLocked(base string) error {
 
 	server.BuildVersion = appVersion
 	gw := server.NewHandler(server.Config{
-		Pool:          p,
-		Upstream:      up,
-		APIKey:        apiKey,
-		Panel:         pn,
-		GlobalEnabled: true,
-		BusyRetry:     true,
-		BusyWaitMax:   60 * time.Second,
+		Pool:                  p,
+		Upstream:              up,
+		APIKey:                apiKey,
+		Panel:                 pn,
+		GlobalEnabled:         true,
+		BusyRetry:             true,
+		BusyWaitMax:           60 * time.Second,
+		// v1.1：features 默认全开（见 loadMobileFeatures；carchive 不接 Live，
+		// loadLive() 以这些静态字段为准，所以这里就是最终生效值）。
+		TTSEnabled:            feats.TTSEnabled,
+		ASREnabled:            feats.ASREnabled,
+		EmbeddingsEnabled:     feats.EmbeddingsEnabled,
+		WatermarkStripEnabled: feats.WatermarkStripEnabled,
+		ThreeDEnabled:         feats.ThreeDEnabled,
 	})
 
 	srv := &http.Server{
@@ -287,6 +307,56 @@ func maskKey(k string) string {
 		return "****"
 	}
 	return k[:2] + "******" + k[len(k)-2:]
+}
+
+// mobileFeatures v1.1 默认全开的 features；config.json 可逐项覆盖。
+// 用 *bool 区分「没写」（nil → 默认开）与「显式写 false」（关）。
+type mobileFeatures struct {
+	TTSEnabled            bool
+	ASREnabled            bool
+	EmbeddingsEnabled     bool
+	WatermarkStripEnabled bool
+	ThreeDEnabled         bool
+}
+
+// loadMobileFeatures 读 <baseDir>/config.json 的 features 节（上游 config.json 同款键名）。
+// 文件不存在、解析失败或某键缺省时，该项默认开；绝不因配置文件问题导致启动失败。
+func loadMobileFeatures(base string) mobileFeatures {
+	def := mobileFeatures{TTSEnabled: true, ASREnabled: true, EmbeddingsEnabled: true, WatermarkStripEnabled: true, ThreeDEnabled: true}
+	raw, err := os.ReadFile(filepath.Join(base, "config.json"))
+	if err != nil {
+		return def
+	}
+	var cfg struct {
+		Features struct {
+			TTSEnabled            *bool `json:"tts_enabled"`
+			ASREnabled            *bool `json:"asr_enabled"`
+			EmbeddingsEnabled     *bool `json:"embeddings_enabled"`
+			WatermarkStripEnabled *bool `json:"watermark_strip_enabled"`
+			ThreeDEnabled         *bool `json:"three_d_enabled"`
+		} `json:"features"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		log.Printf("[wb2api] config.json 解析失败，用默认全开: %v", err)
+		return def
+	}
+	f := cfg.Features
+	if f.TTSEnabled != nil {
+		def.TTSEnabled = *f.TTSEnabled
+	}
+	if f.ASREnabled != nil {
+		def.ASREnabled = *f.ASREnabled
+	}
+	if f.EmbeddingsEnabled != nil {
+		def.EmbeddingsEnabled = *f.EmbeddingsEnabled
+	}
+	if f.WatermarkStripEnabled != nil {
+		def.WatermarkStripEnabled = *f.WatermarkStripEnabled
+	}
+	if f.ThreeDEnabled != nil {
+		def.ThreeDEnabled = *f.ThreeDEnabled
+	}
+	return def
 }
 
 func main() {}
