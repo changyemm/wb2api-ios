@@ -103,6 +103,7 @@ type runningServer struct {
 
 var (
 	mu           sync.Mutex
+	startMu      sync.Mutex // WBStart 串行化（v1.2.7）：保证同一时间只有一个装配在跑；不要复用 mu，避免与 Serve 退出/状态查询/teardown 死锁
 	cur          *runningServer
 	lastStartErr string // 最近一次启动失败的细节（WBJSON 报告；失败不建 stub，#5）
 )
@@ -160,6 +161,12 @@ func waitDone(ch <-chan struct{}, d time.Duration, name string) {
 // 负数=启动失败（-1 baseDir 为空；-2 通用失败；-3 监听失败）。
 // 失败细节见 WBJSON 的 last_error。
 func WBStart(baseDir *C.char) (rc C.int) {
+	// v1.2.7：串行化启动。startMu 保证同一时间只有一个 WBStart 在装配
+	// （两个同时调都会看到 cur==nil、都跑 startLocked，一个 EADDRINUSE，
+	// 失败方 teardown 会把全局日志输出恢复成 stderr，破坏成功方的面板日志）。
+	// 锁顺序：先 startMu 再 mu，全程一致，不死锁。WBStop 不碰 startMu。
+	startMu.Lock()
+	defer startMu.Unlock()
 	// #4：panic 隔离。Go 侧任何 panic 都不能穿到宿主 App。
 	defer func() {
 		if r := recover(); r != nil {
@@ -523,6 +530,14 @@ func startLocked(base string) (*runningServer, error) {
 	rs.p = p
 
 	up := upstream.New() // 默认 node TLS 指纹（与 main() 一致）
+	// #2：global realm 路由开关（三处与上游对齐，缺省 true）。
+	// 上游默认 true（config.go:690、client.go:1117、auth init）；纯 CN 账号
+	// 恒判 cn，global base 不用，行为不变。false 是逃生门（纯 CN 锁死），
+	// 不是常规配置——显式写 true，别让它隐式依赖默认值。
+	// （当前账号是 CN，池里没有 realm=global 的账号；但 true 对 CN 无害，
+	// 且以后加 global 账号无需改代码。）
+	up.GlobalEnabled = true
+	auth.SetGlobalEnabled(true)
 	rs.up = up
 
 	// v1.1：features 默认全开；<baseDir>/config.json 的 features 节可逐项覆盖（缺省即开）。
