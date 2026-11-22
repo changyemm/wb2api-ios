@@ -12,10 +12,11 @@
 // 与 cmd/server/main() 的行为差异（有意为之）：
 //   - 不解析 flag、不做自更新（updater.HandleSelfUpdate 在 dylib 里极危险）、
 //     不装 signal handler、不调 log.Fatalf（失败以返回值 + WBJSON 报告）。
-//   - 配置不读 config.json：监听地址写死 0.0.0.0:7863，api_key 走
+//   - 配置只读 <baseDir>/config.json 的 features 节（默认全开）与 api_key.txt；
+//     监听地址写死 0.0.0.0:7863，api_key 走
 //     环境变量 WB2A_API_KEY → <baseDir>/api_key.txt → 首次随机生成并落盘。
-//   - 面板配置页（LoadConfig/SaveConfig）v1 留空：面板里改配置返回 501，
-//     v1.1 再接（见 README）。
+//   - 面板配置页（LoadConfig/SaveConfig）v1.1 已接：改 api_key 与 features，
+//     热生效、无需重启；用量/请求日志/余额趋势/积分历史/代理池记录器也已接线。
 //   - 数据目录不走相对路径：宿主 App 的 CWD 是只读的 app bundle，
 //     必须由 tweak 传绝对路径（NSHomeDirectory 下的 Library/WBPanel）。
 package main
@@ -42,12 +43,19 @@ import (
 	"unsafe"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
+	"github.com/misakano7545/workbuddy2api-panel/internal/credithist"
+	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
+	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
 	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
 	"github.com/misakano7545/workbuddy2api-panel/internal/server"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
 
 // appVersion 面板与 /status 里展示的版本；CI 用 -X 注入。
@@ -200,31 +208,87 @@ func startLocked(base string) error {
 
 	up := upstream.New() // 默认 node TLS 指纹（与 main() 一致）
 
-	// v1.1：features 默认全开（用户要求；手机上没有配置页可改，只能默认开）。
-	// <baseDir>/config.json 的 features 节可逐项覆盖（缺省即开；文件不存在/解析失败则全开）。
+	// v1.1：features 默认全开；<baseDir>/config.json 的 features 节可逐项覆盖（缺省即开）。
 	feats := loadMobileFeatures(base)
 	log.Printf("[wb2api] features: tts=%v asr=%v embeddings=%v watermark_strip=%v 3d=%v",
 		feats.TTSEnabled, feats.ASREnabled, feats.EmbeddingsEnabled, feats.WatermarkStripEnabled, feats.ThreeDEnabled)
-	// 3D 要能真正跑起来，只开开关不够，还得接凭证来源（否则报 503 无凭证）：
-	// 走自动签发（与上游默认 three_d_auto_token=true 一致），用账号自己的 access token
-	// 换 ck_t_；静态凭证表为空（手机上无处配）。静态 API Key 账号（ck_/pt_ 前缀）签不出来，
-	// 上游会自动跳过并回 503，属上游行为。
-	if feats.ThreeDEnabled {
-		up.ThreeDCredential = upstream.NewAutoThreeDCredentials(up.FetchClientTempKey, upstream.NewStaticThreeDCredentials(nil))
+	// 3D 凭证来源常驻（与上游默认 three_d_auto_token=true 一致）：用账号自己的 access token
+	// 换 ck_t_，静态凭证表为空。只开开关不接凭证会报 503；常驻则面板上把 3D 从关改开也
+	// 能直接用，不用重启。静态 API Key 账号（ck_/pt_ 前缀）签不出来，上游自动跳过并回 503。
+	up.ThreeDCredential = upstream.NewAutoThreeDCredentials(up.FetchClientTempKey, upstream.NewStaticThreeDCredentials(nil))
+
+	// Live 热配置持有者：api_key 与 features 的运行期唯一真实来源。
+	// handler 与面板都优先读 Live 快照（静态字段只作 Live 为 nil 时的回退）。
+	live := livecfg.New(livecfg.Snapshot{
+		APIKey:                apiKey,
+		TTSEnabled:            feats.TTSEnabled,
+		ASREnabled:            feats.ASREnabled,
+		EmbeddingsEnabled:     feats.EmbeddingsEnabled,
+		WatermarkStripEnabled: feats.WatermarkStripEnabled,
+		ThreeDEnabled:         feats.ThreeDEnabled,
+	})
+
+	// 记录器（⑥⑦⑧⑩）：与 state.json 同目录，随 WBPanel 一起搬移；损坏不影响启动。
+	configPath := filepath.Join(base, "config.json")
+	bal := balance.New(filepath.Join(dataDir, "balance_history.json"))
+	bal.Start()
+	rec := usage.New(filepath.Join(dataDir, "usage.json"))
+	rec.Start()
+	requestLog := reqlog.New(reqlog.Config{
+		Dir:           filepath.Join(dataDir, "request-logs"),
+		Enabled:       true,
+		RetentionDays: 30,
+		MaxBytes:      100 << 20,
+	})
+	creditHist := credithist.New(filepath.Join(dataDir, "credit-history.json"), 2000)
+	up.SetCreditObserver(creditHist.Observe)
+	// 代理池：失败只记日志、不影响启动（面板代理接口届时回空集）。
+	var proxies *proxypool.Manager
+	if baseTr, ok := up.HTTP.Transport.(*http.Transport); ok {
+		if pm, err := proxypool.New(filepath.Join(dataDir, "proxy-pool.json"), baseTr, upstream.NewDNSDialer(nil)); err != nil {
+			log.Printf("[wb2api] proxy pool 不可用: %v", err)
+		} else {
+			proxies = pm
+			go proxies.Run(context.Background())
+		}
 	}
 
-	// scheduler 空 Config 即用默认排程：签到 9/21 点、旅行 9/21 点、
-	// 活跃 10 点、保活 22 点、成长 11 点；面板手动签到/保活走它。
-	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up})
+	// scheduler：余额采样记录器挂在余额刷新之后（nil = 不采样）。
+	// 默认排程：签到 9/21 点、旅行 9/21 点、活跃 10 点、保活 22 点、成长 11 点；面板手动签到/保活走它。
+	sch := scheduler.New(scheduler.Config{Pool: p, Upstream: up, Balance: bal})
+
+	// 配置页后端（④）：LoadConfig 回显当前生效值（Live 快照），SaveConfig 合并落盘 + 热应用。
+	// configSaveMu 串行化保存（并发两次保存会在读-改-写与热应用之间互踩）。
+	var configSaveMu sync.Mutex
+	loadCfg := func() (any, error) {
+		return mobileConfigForPanel(live), nil
+	}
+	saveCfg := func(raw []byte) ([]string, error) {
+		configSaveMu.Lock()
+		defer configSaveMu.Unlock()
+		return saveMobileConfig(raw, configPath, filepath.Join(base, "api_key.txt"), live)
+	}
 
 	pn := panel.New(panel.Config{
-		Pool:      p,
-		Upstream:  up,
-		Scheduler: sch,
-		AuthDir:   authDir,
-		APIKey:    apiKey,
-		Version:   appVersion,
-		// ConfigPath/LoadConfig/SaveConfig 留空：面板配置页 v1 返回 501。
+		Pool:             p,
+		ProxyPool:        proxies,
+		Usage:            rec,
+		RequestLog:       requestLog,
+		Upstream:         up,
+		Scheduler:        sch,
+		Balance:          bal,
+		CreditHistory:    creditHist,
+		ProbeFile:        filepath.Join(dataDir, "output_probes.json"),
+		AuthDir:          authDir,
+		APIKey:           apiKey,
+		Version:          appVersion,
+		Live:             live,
+		ConfigPath:       configPath,
+		LoadConfig:       loadCfg,
+		SaveConfig:       saveCfg,
+		AutoTasksEnabled: sch.GrowthEnabled,
+		RescueToday:      server.RescueToday,
+		ModelFallback:    func() map[string]string { return live.Load().ModelFallback },
 	})
 
 	server.BuildVersion = appVersion
@@ -233,11 +297,14 @@ func startLocked(base string) error {
 		Upstream:              up,
 		APIKey:                apiKey,
 		Panel:                 pn,
+		Live:                  live,
+		Usage:                 rec,
+		RequestLog:            requestLog,
 		GlobalEnabled:         true,
 		BusyRetry:             true,
 		BusyWaitMax:           60 * time.Second,
-		// v1.1：features 默认全开（见 loadMobileFeatures；carchive 不接 Live，
-		// loadLive() 以这些静态字段为准，所以这里就是最终生效值）。
+		Tasks:                 sch,
+		// 静态字段与 Live 快照同值（Live 为 nil 时的回退；正常走 Live）。
 		TTSEnabled:            feats.TTSEnabled,
 		ASREnabled:            feats.ASREnabled,
 		EmbeddingsEnabled:     feats.EmbeddingsEnabled,
@@ -357,6 +424,127 @@ func loadMobileFeatures(base string) mobileFeatures {
 		def.ThreeDEnabled = *f.ThreeDEnabled
 	}
 	return def
+}
+
+// mobileConfigForPanel 组装配置页回显对象：当前生效值（Live 快照），不是只读文件。
+// 前端按 CFG_MAP 填表；没写的字段留空，保存时跳过（不下发），所以只返回 api_key 与
+// features 是安全的。关键：features 必须回显当前值（否则复选框默认不勾，保存时
+// 会把没动过的开关误发成 false 关掉）。
+func mobileConfigForPanel(live *livecfg.Holder) map[string]any {
+	snap := live.Load()
+	return map[string]any{
+		"api_key": snap.APIKey,
+		"features": map[string]any{
+			"tts_enabled":             snap.TTSEnabled,
+			"asr_enabled":             snap.ASREnabled,
+			"embeddings_enabled":      snap.EmbeddingsEnabled,
+			"watermark_strip_enabled": snap.WatermarkStripEnabled,
+			"three_d_enabled":         snap.ThreeDEnabled,
+		},
+	}
+}
+
+// saveMobileConfig 面板保存配置：解析提交 → 与磁盘 config.json 深度合并（缺失键保留现值）
+// → 校验 → 原子落盘 → api_key 同步写 api_key.txt（重启时 resolveAPIKey 只读它，不读
+// config.json；不同步下次启动会用回旧 key）→ 热应用到 Live（api_key 与 features 立即
+// 生效，无需重启）。返回需重启字段（手机端恒为空）。
+func saveMobileConfig(raw []byte, configPath, keyFile string, live *livecfg.Holder) ([]string, error) {
+	var incoming map[string]any
+	if err := json.Unmarshal(raw, &incoming); err != nil {
+		return nil, fmt.Errorf("parse submitted config: %w", err)
+	}
+	cur := map[string]any{}
+	if b, err := os.ReadFile(configPath); err == nil {
+		if err := json.Unmarshal(b, &cur); err != nil {
+			return nil, fmt.Errorf("parse current config: %w", err)
+		}
+	}
+	merged := mergeConfigMaps(cur, incoming)
+	// 校验：只认 api_key（字符串，非空——手机端监听 0.0.0.0 必须有密钥）与 features.*（布尔）；
+	// 其余键原样保留、不校验（手机端不用）。
+	if v, ok := merged["api_key"]; ok {
+		k, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("api_key 必须是字符串")
+		}
+		if strings.TrimSpace(k) == "" {
+			return nil, fmt.Errorf("api_key 不能为空：手机端监听 0.0.0.0，必须设访问密钥")
+		}
+	}
+	if v, ok := merged["features"]; ok {
+		fm, ok := v.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("features 必须是对象")
+		}
+		for _, k := range []string{"tts_enabled", "asr_enabled", "embeddings_enabled", "watermark_strip_enabled", "three_d_enabled"} {
+			if fv, ok := fm[k]; ok {
+				if _, ok := fv.(bool); !ok {
+					return nil, fmt.Errorf("features.%s 必须是布尔值", k)
+				}
+			}
+		}
+	}
+	out, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	if err := safefile.WriteKeep(configPath, out, 0o600); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	// api_key 同步写 api_key.txt（重启时的唯一来源）。
+	if v, ok := merged["api_key"]; ok {
+		if k, ok := v.(string); ok && strings.TrimSpace(k) != "" {
+			_ = os.WriteFile(keyFile, []byte(strings.TrimSpace(k)+"\n"), 0o600)
+		}
+	}
+	// 热应用：从当前快照出发，只覆盖 api_key 与 features（缺失键保留现值）。
+	snap := live.Load()
+	if v, ok := merged["api_key"]; ok {
+		if k, ok := v.(string); ok {
+			snap.APIKey = strings.TrimSpace(k)
+		}
+	}
+	if v, ok := merged["features"]; ok {
+		if fm, ok := v.(map[string]any); ok {
+			if fv, ok := fm["tts_enabled"].(bool); ok {
+				snap.TTSEnabled = fv
+			}
+			if fv, ok := fm["asr_enabled"].(bool); ok {
+				snap.ASREnabled = fv
+			}
+			if fv, ok := fm["embeddings_enabled"].(bool); ok {
+				snap.EmbeddingsEnabled = fv
+			}
+			if fv, ok := fm["watermark_strip_enabled"].(bool); ok {
+				snap.WatermarkStripEnabled = fv
+			}
+			if fv, ok := fm["three_d_enabled"].(bool); ok {
+				snap.ThreeDEnabled = fv
+			}
+		}
+	}
+	live.Store(snap)
+	log.Printf("[wb2api] 配置已保存并热生效（api_key 与 features 无需重启）")
+	return []string{}, nil
+}
+
+// mergeConfigMaps 深度合并：incoming 里出现的键覆盖 cur；嵌套对象递归合并；
+// incoming 里没有的键保留 cur 的值（这就是「缺失字段保留现值」）。
+func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
+	out := make(map[string]any, len(cur)+len(incoming))
+	for k, v := range cur {
+		out[k] = v
+	}
+	for k, v := range incoming {
+		if vm, ok := v.(map[string]any); ok {
+			if cm, ok := out[k].(map[string]any); ok {
+				out[k] = mergeConfigMaps(cm, vm)
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func main() {}
