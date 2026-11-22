@@ -94,7 +94,7 @@ jobs:
             -target arm64-apple-ios14.0 \
             -isysroot "$SDK_PATH" \
             -Wl,-all_load libwb2api-ios.a \
-            -framework CoreFoundation -framework Security -framework UIKit -framework WebKit -lresolv \
+            -framework CoreFoundation -framework Foundation -framework CoreGraphics -framework Security -framework UIKit -framework WebKit -lresolv \
             -o wb2api.dylib tweak/tweak.c ui.o
           install_name_tool -id "@rpath/wb2api.dylib" wb2api.dylib
           ls -l wb2api.dylib
